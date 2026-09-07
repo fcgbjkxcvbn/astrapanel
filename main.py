@@ -1,8 +1,8 @@
 # ============================================================
-# PXPanel 13.6.1
+# PXPanel 13.8.0
 # Railway Ready
+# Created By PIXON
 # ============================================================
-
 import asyncio
 import base64
 import hashlib
@@ -12,16 +12,13 @@ import os
 import secrets
 import string
 import time
-
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote, parse_qs
-
 import aiofiles
 import httpx
 import uvicorn
-
 from fastapi import (
     FastAPI,
     Request,
@@ -36,13 +33,12 @@ from fastapi.responses import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
-
 # ============================================================
 # APP
 # ============================================================
 
 APP_NAME = "PXPanel"
-APP_VERSION = "13.6.1"
+APP_VERSION = "13.10.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -53,7 +49,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(APP_NAME)
-
 
 # ============================================================
 # TIMEZONE
@@ -95,6 +90,8 @@ DATA_DIR.mkdir(
 )
 
 DATA_FILE = DATA_DIR / "pixonpanel_state.json"
+TG_FILE = DATA_DIR / "telegram_settings.json"
+
 SECRET_FILE = DATA_DIR / "pixonpanel_secret.key"
 
 
@@ -233,7 +230,7 @@ PROTOCOLS = (
 )
 
 PROTOCOL_LABELS = {
-    "vless-ws": "VLESS WebSocket",
+    "vless-ws": "VLESS WebSocket ⭐",
     "xhttp-packet-up": "XHTTP Packet Up",
     "xhttp-stream-up": "XHTTP Stream Up",
     "xhttp-stream-one": "XHTTP Stream One",
@@ -708,17 +705,65 @@ def hash_password(
     ).hexdigest()
 
 
-DEFAULT_ADMIN_PASSWORD = os.environ.get(
-    "ADMIN_PASSWORD",
-    "pxpanel2026",
-)
-
+# No default password — first-run setup required unless ADMIN_PASSWORD env is set
+_env_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
 AUTH = {
-    "password_hash":
-        hash_password(
-            DEFAULT_ADMIN_PASSWORD
-        )
+    "password_hash": hash_password(_env_pw) if _env_pw else "",
+    "password_configured": bool(_env_pw),
 }
+
+# Sub-admin accounts (panel operators with granular permissions)
+ADMIN_ACCOUNTS: dict = {}
+# session_token -> {"role": "owner"|"admin", "admin_id": str|None, "username": str}
+SESSION_META: dict = {}
+
+ALL_PERMS = (
+    "dash", "configs", "create", "stats", "logs",
+    "settings", "support", "telegram", "news", "admins",
+)
+DEFAULT_PERMS = {p: True for p in ALL_PERMS}
+
+
+def default_admin_record(username: str, password: str, **kwargs) -> dict:
+    return {
+        "id": secrets.token_hex(8),
+        "username": username.strip().lower(),
+        "password_hash": hash_password(password),
+        "label": kwargs.get("label") or username,
+        "limit_bytes": int(kwargs.get("limit_bytes") or 0),
+        "used_bytes": 0,
+        "expires_at": kwargs.get("expires_at"),
+        "active": True,
+        "blocked": False,
+        "permissions": {**DEFAULT_PERMS, **(kwargs.get("permissions") or {})},
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+def find_admin_by_username(username: str):
+    u = (username or "").strip().lower()
+    for aid, a in ADMIN_ACCOUNTS.items():
+        if a.get("username") == u:
+            return aid, a
+    return None, None
+
+
+def admin_is_valid(admin: dict) -> bool:
+    if not admin or admin.get("blocked") or not admin.get("active", True):
+        return False
+    exp = admin.get("expires_at")
+    if exp:
+        try:
+            if datetime.now() > datetime.fromisoformat(str(exp)):
+                return False
+        except Exception:
+            pass
+    limit = int(admin.get("limit_bytes") or 0)
+    used = int(admin.get("used_bytes") or 0)
+    if limit > 0 and used >= limit:
+        return False
+    return True
+
 
 
 # ============================================================
@@ -727,7 +772,7 @@ AUTH = {
 # Maximum failed login attempts per IP inside the rolling window.
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
-LOGIN_LOCKOUT_SECONDS = 15 * 60
+LOGIN_LOCKOUT_SECONDS = 30 * 60  # 30 minutes lockout
 LOGIN_MIN_PASSWORD_LENGTH = 6
 
 LOGIN_FAILURES = defaultdict(deque)
@@ -803,7 +848,7 @@ SESSION_TTL = (
 )
 
 
-async def create_session() -> str:
+async def create_session(meta: dict | None = None) -> str:
 
     token = secrets.token_urlsafe(48)
 
@@ -812,6 +857,7 @@ async def create_session() -> str:
             time.time()
             + SESSION_TTL
         )
+        SESSION_META[token] = meta or {"role": "owner", "admin_id": None, "username": "owner"}
 
     return token
 
@@ -853,6 +899,32 @@ async def destroy_session(
             token,
             None,
         )
+        SESSION_META.pop(token, None)
+
+
+def get_session_meta(token: str | None) -> dict:
+    if not token:
+        return {"role": "owner", "admin_id": None, "username": "owner", "permissions": {p: True for p in ALL_PERMS}}
+    meta = dict(SESSION_META.get(token) or {"role": "owner", "admin_id": None, "username": "owner"})
+    if meta.get("role") == "owner":
+        meta["permissions"] = {p: True for p in ALL_PERMS}
+    else:
+        aid = meta.get("admin_id")
+        admin = ADMIN_ACCOUNTS.get(aid or "") or {}
+        meta["permissions"] = {p: bool((admin.get("permissions") or {}).get(p, False)) for p in ALL_PERMS}
+        meta["blocked"] = bool(admin.get("blocked"))
+    return meta
+
+
+def require_perm(perm: str):
+    async def _dep(request: Request, token=Depends(require_auth)):
+        meta = get_session_meta(token)
+        if meta.get("role") == "owner":
+            return token
+        if not (meta.get("permissions") or {}).get(perm):
+            raise HTTPException(status_code=403, detail="دسترسی به این بخش مجاز نیست")
+        return token
+    return _dep
 
 
 async def require_auth(
@@ -869,6 +941,14 @@ async def require_auth(
             status_code=401,
             detail="unauthorized",
         )
+
+    meta = get_session_meta(token)
+    if meta.get("role") == "admin":
+        aid = meta.get("admin_id")
+        admin = ADMIN_ACCOUNTS.get(aid or "")
+        if not admin_is_valid(admin or {}):
+            await destroy_session(token)
+            raise HTTPException(status_code=401, detail="حساب منقضی یا مسدود شده است")
 
     return token
 
@@ -1013,6 +1093,7 @@ def get_link_info(
         "clean_ips": clean_ips,
         "alarm_enabled": bool(link.get("alarm_enabled", False)),
         "category_id": str(link.get("category_id") or "0"),
+        "sort_order": int(link.get("sort_order") or 0),
         "category_number": int(cat.get("number", 0)),
         "category_name": str(cat.get("name", "عمومی")),
         "config_count": cfg_count,
@@ -1075,14 +1156,16 @@ async def load_state():
             )
         )
 
+        ADMIN_ACCOUNTS.clear()
+        ADMIN_ACCOUNTS.update(data.get("admin_accounts") or {})
+
         stored_password = data.get(
             "password_hash"
         )
 
         if stored_password:
-            AUTH[
-                "password_hash"
-            ] = stored_password
+            AUTH["password_hash"] = stored_password
+            AUTH["password_configured"] = True
 
         # Compatibility for older records
         for uid, link in LINKS.items():
@@ -1135,6 +1218,7 @@ async def load_state():
             link.setdefault("alarm_enabled", False)
             link.setdefault("category_id", "0")
             link.setdefault("config_count", 1)
+            link.setdefault("sort_order", 0)
             link.setdefault("usage_history", [])
 
         logger.info(
@@ -1171,6 +1255,9 @@ async def save_state():
 
                 "categories":
                     dict(CATEGORIES),
+
+                "admin_accounts":
+                    dict(ADMIN_ACCOUNTS),
 
                 "password_hash":
                     AUTH[
@@ -1222,23 +1309,9 @@ _default_link_created = False
 
 
 async def ensure_default_categories():
-    if CATEGORIES:
-        return
-    CATEGORIES["0"] = {
-        "id": "0", "name": "عمومی", "number": 0,
-        "limit_bytes": 0, "expires_days": 0, "connection_limit": 0,
-        "speed_limit_bytes": 0, "ip_limit": 0, "clean_ips": [],
-        "random_name": False, "single_user": False,
-        "created_at": datetime.now().isoformat(),
-    }
-    CATEGORIES["1"] = {
-        "id": "1", "name": "VIP", "number": 1,
-        "limit_bytes": 0, "expires_days": 0, "connection_limit": 1,
-        "speed_limit_bytes": 0, "ip_limit": 1, "clean_ips": [],
-        "random_name": False, "single_user": True,
-        "created_at": datetime.now().isoformat(),
-    }
-    asyncio.create_task(save_state())
+    # گروه‌های پیش‌فرض ساخته نمی‌شوند — کاربر خودش می‌سازد
+    return
+
 
 async def ensure_default_link():
 
@@ -2066,6 +2139,31 @@ html{scroll-behavior:smooth} body{overflow-x:hidden} button,input,select,textare
 @media(max-width:900px){.container,.shell,.dashboard,.main,.content{max-width:100%!important;width:100%!important}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.sidebar{z-index:1000}}
 @media(max-width:640px){body{padding:10px!important;font-size:14px}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:1fr!important}.card,.panel,.section,.modal{border-radius:18px!important}.modal{max-height:92vh;overflow:auto;padding:14px!important}.header,.topbar,.toolbar,.actions{flex-wrap:wrap!important}.header>* ,.topbar>*{max-width:100%}.btn,button{min-height:44px}.field input,.field select,.field textarea,input,select,textarea{min-height:44px;font-size:16px;max-width:100%}table{display:block;overflow-x:auto;white-space:nowrap}.link-row,.config-row{flex-direction:column!important;align-items:stretch!important}.brand-name{font-size:15px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Toggle switch */
+.switch{position:relative;display:inline-block;width:42px;height:24px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;inset:0;background:rgba(255,255,255,.12);border-radius:24px;transition:.2s}
+.slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:var(--green)}
+.switch input:checked+.slider:before{transform:translateX(18px)}
+
+
+.conn-badge{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:20px;padding:0 7px;border-radius:8px;font-size:10px;font-weight:800}
+.conn-badge.green{background:rgba(34,197,94,.18);color:#4ade80}
+.conn-badge.gray{background:rgba(148,163,184,.15);color:#94a3b8}
+.conn-badge.orange{background:rgba(245,158,11,.18);color:#fbbf24}
+.conn-badge.red{background:rgba(239,68,68,.18);color:#f87171}
+
+
+.bottom-bulk{position:fixed;left:0;right:0;bottom:0;z-index:400;display:none;padding:12px 16px;background:var(--card);border-top:1px solid var(--card-b);backdrop-filter:blur(12px)}
+.bottom-bulk.show{display:block}
+.bottom-bulk-inner{max-width:960px;margin:0 auto;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center}
+.bottom-bulk select{padding:8px 10px;border-radius:10px;border:1px solid var(--card-b);background:var(--input-bg);color:var(--t1);font-family:inherit;font-size:12px}
+
+table th:first-child, table td:first-child{overflow:visible}
+.cfg-chk{accent-color:var(--accent)}
+#page-donate .page-title{width:100%}
 </style>
 </head>
 
@@ -2083,7 +2181,7 @@ PX Panel
 </div>
 
 <div class="version">
-13.6.1
+13.8.0
 </div>
 </div>
 
@@ -2131,7 +2229,7 @@ class="btn secondary"
 <div class="footer">
 
 <span>
-PX Panel · 13.6.1
+PX Panel · 13.8.0
 </span>
 
 <a
@@ -2146,6 +2244,16 @@ class="support"
 
 </div>
 
+
+<div id="bottomBulkBar" class="bottom-bulk">
+  <div class="bottom-bulk-inner">
+    <span id="bulkCount">0 انتخاب</span>
+    <select id="bulkGroup"></select>
+    <button class="btn btn-sm" onclick="bulkMoveGroup()">انتقال به گروه</button>
+    <button class="btn btn-sm btn-d" onclick="bulkDelete()">حذف انتخاب‌شده</button>
+    <button class="btn btn-sm" onclick="clearSelection()">لغو</button>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -2196,254 +2304,129 @@ async def health():
 LOGIN_HTML = r"""
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1"
->
-
-<title>ورود | PX Panel</title>
-
-<link
-rel="preconnect"
-href="https://fonts.googleapis.com"
->
-
-<link
-rel="preconnect"
-href="https://fonts.gstatic.com"
-crossorigin
->
-
-<link
-href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap"
-rel="stylesheet"
->
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>پی ایکس پنل</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-
-*{
-    box-sizing:border-box;
-}
-
+*{box-sizing:border-box;margin:0;padding:0}
 body{
-    margin:0;
-    min-height:100vh;
-
-    display:flex;
-    align-items:center;
-    justify-content:center;
-
-    padding:20px;
-
-    font-family:"Vazirmatn",sans-serif;
-    color:#fff;
-
-    background:
-        radial-gradient(
-            circle at 15% 15%,
-            rgba(37,99,235,.20),
-            transparent 32%
-        ),
-        #07070a;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;
+  font-family:Vazirmatn,sans-serif;color:#f1f5f9;background:#0a0a0f;
 }
-
 .card{
-    width:100%;
-    max-width:420px;
-    padding:30px;
-    border-radius:26px;
-
-    background:rgba(255,255,255,.045);
-    border:1px solid rgba(255,255,255,.09);
-
-    backdrop-filter:blur(28px);
-
-    box-shadow:
-        0 30px 90px rgba(0,0,0,.45);
+  width:100%;max-width:380px;padding:28px 24px;border-radius:18px;
+  background:#12121a;border:1px solid rgba(255,255,255,.08);
 }
-
-.logo{
-    width:49px;
-    height:49px;
-
-    display:flex;
-    align-items:center;
-    justify-content:center;
-
-    border-radius:16px;
-    margin-bottom:20px;
-
-    font-weight:900;
-
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #3b82f6
-        );
-}
-
-h1{
-    margin:0;
-    font-size:25px;
-}
-
-.version{
-    margin-top:5px;
-    color:#60a5fa;
-    font-size:11px;
-}
-
-.desc{
-    margin-top:9px;
-    color:rgba(255,255,255,.48);
-    line-height:1.9;
-    font-size:12px;
-}
-
-form{
-    margin-top:21px;
-}
-
-label{
-    display:block;
-    margin-bottom:8px;
-    font-size:12px;
-    color:rgba(255,255,255,.55);
-}
-
+h1{font-size:20px;font-weight:800;text-align:center;margin-bottom:22px;letter-spacing:-.02em}
+label{display:block;font-size:12px;color:rgba(255,255,255,.5);margin-bottom:6px;font-weight:600}
 input{
-    width:100%;
-    padding:14px;
-
-    border:1px solid rgba(255,255,255,.08);
-    outline:none;
-    border-radius:14px;
-
-    color:#fff;
-    background:rgba(0,0,0,.18);
-
-    direction:ltr;
-    text-align:left;
-
-    font-family:"Vazirmatn",sans-serif;
+  width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.1);
+  background:rgba(0,0,0,.35);color:#fff;font-family:inherit;font-size:14px;outline:none;margin-bottom:14px;
+  direction:ltr;text-align:left;
 }
-
-input:focus{
-    border-color:rgba(129,140,248,.6);
-}
-
+input:focus{border-color:rgba(59,130,246,.55)}
 button{
-    width:100%;
-    margin-top:13px;
-    padding:14px;
-
-    border:0;
-    border-radius:14px;
-
-    color:#fff;
-    cursor:pointer;
-
-    font-family:"Vazirmatn",sans-serif;
-    font-weight:800;
-
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #3b82f6
-        );
+  width:100%;padding:13px;border:none;border-radius:12px;
+  background:#2563eb;color:#fff;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;margin-top:4px;
 }
-
-.error{
-    margin-top:12px;
-    padding:11px;
-
-    border-radius:12px;
-
-    color:#fca5a5;
-    background:rgba(239,68,68,.08);
-    border:1px solid rgba(239,68,68,.15);
-
-    font-size:11px;
-}
-
-.support{
-    display:block;
-    margin-top:18px;
-    text-align:center;
-
-    color:#60a5fa;
-    text-decoration:none;
-
-    font-size:11px;
-}
-
+button:hover{background:#1d4ed8}
+button:disabled{opacity:.5;cursor:not-allowed}
+.err{display:none;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.28);color:#fca5a5;padding:10px 12px;border-radius:10px;font-size:12px;margin-bottom:12px}
+.err.show{display:block}
+.warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.28);border-radius:12px;padding:12px;font-size:12px;line-height:1.85;color:#fbbf24;margin-bottom:16px}
+.warn code{background:rgba(0,0,0,.35);padding:2px 6px;border-radius:6px;font-family:ui-monospace,monospace;color:#93c5fd}
+.hidden{display:none}
 </style>
-
 </head>
-
 <body>
-
 <div class="card">
+  <h1>پی ایکس پنل</h1>
 
-<div class="logo">
-P
+  <div id="setupBox" class="hidden">
+    <div class="warn">
+      برای نگه‌داشتن داده‌ها روی Railway حتماً Volume با مسیر <code>/data</code> وصل کنید.
+    </div>
+    <div class="err" id="setupErr"></div>
+    <label>رمز عبور پنل</label>
+    <input type="password" id="setupPw" placeholder="حداقل ۶ کاراکتر" autocomplete="new-password">
+    <label>تکرار رمز عبور</label>
+    <input type="password" id="setupPw2" placeholder="تکرار رمز" autocomplete="new-password">
+    <button type="button" id="setupBtn" onclick="doSetup()">تنظیم رمز و ورود</button>
+  </div>
+
+  <div id="loginBox" class="hidden">
+    <div class="err" id="loginErr"></div>
+    <form id="loginForm">
+      <label>نام کاربری ادمین</label>
+      <input type="text" id="loginUser" placeholder="خالی = مالک پنل" autocomplete="username">
+      <label>رمز عبور</label>
+      <input type="password" id="loginPw" placeholder="رمز عبور" autocomplete="current-password" required>
+      <button type="submit" id="loginBtn">ورود</button>
+    </form>
+  </div>
 </div>
-
-<h1>
-ورود به PX Panel
-</h1>
-
-<div class="version">
-13.6.1
-</div>
-
-<div class="desc">
-برای ادامه رمز عبور پنل مدیریت را وارد کنید.
-</div>
-
-<form
-method="post"
-action="/login"
->
-
-<label>
-رمز عبور
-</label>
-
-<input
-type="password"
-name="password"
-autocomplete="current-password"
-autofocus
-placeholder="رمز عبور"
->
-
-<button type="submit">
-ورود به پنل
-</button>
-
-</form>
-
-<a
-href="https://t.me/Pixonal"
-target="_blank"
-class="support"
->
-پشتیبانی @Pixonal
-</a>
-
-</div>
-
+<script>
+async function checkSetup(){
+  try{
+    const r=await fetch('/api/setup/status',{cache:'no-store'});
+    const d=await r.json();
+    if(d.needs_setup){
+      document.getElementById('setupBox').classList.remove('hidden');
+    }else{
+      document.getElementById('loginBox').classList.remove('hidden');
+      document.getElementById('loginPw').focus();
+    }
+  }catch(e){
+    document.getElementById('loginBox').classList.remove('hidden');
+  }
+}
+async function doSetup(){
+  const pw=document.getElementById('setupPw').value;
+  const pw2=document.getElementById('setupPw2').value;
+  const err=document.getElementById('setupErr');
+  err.classList.remove('show');
+  if(pw.length<6){err.textContent='رمز حداقل ۶ کاراکتر';err.classList.add('show');return}
+  if(pw!==pw2){err.textContent='تکرار رمز یکسان نیست';err.classList.add('show');return}
+  const btn=document.getElementById('setupBtn');btn.disabled=true;
+  try{
+    const r=await fetch('/api/setup/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,repeat_password:pw2})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.detail||'خطا');
+    location.href='/dashboard';
+  }catch(e){
+    err.textContent=e.message||'خطا';err.classList.add('show');
+    btn.disabled=false;
+  }
+}
+document.getElementById('loginForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const err=document.getElementById('loginErr');
+  err.classList.remove('show');
+  const btn=document.getElementById('loginBtn');btn.disabled=true;
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      password:document.getElementById('loginPw').value,
+      username:document.getElementById('loginUser').value
+    })});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      throw new Error(d.detail||'رمز اشتباه است');
+    }
+    location.href='/dashboard';
+  }catch(e){
+    err.textContent=e.message;err.classList.add('show');
+    btn.disabled=false;
+  }
+});
+checkSetup();
+</script>
 </body>
 </html>
 """
+
+
 
 
 def login_error_html(
@@ -2464,6 +2447,43 @@ def login_error_html(
             """
         ),
     )
+
+
+
+# ============================================================
+# FIRST-RUN SETUP
+# ============================================================
+
+@app.get("/api/setup/status")
+async def setup_status():
+    return {
+        "password_configured": bool(AUTH.get("password_configured") and AUTH.get("password_hash")),
+        "needs_setup": not bool(AUTH.get("password_configured") and AUTH.get("password_hash")),
+    }
+
+
+@app.post("/api/setup/password")
+async def setup_password(request: Request):
+    if AUTH.get("password_configured") and AUTH.get("password_hash"):
+        raise HTTPException(status_code=400, detail="رمز قبلاً تنظیم شده است")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="اطلاعات نامعتبر")
+    pw = str(body.get("password") or "")
+    rp = str(body.get("repeat_password") or body.get("confirm") or "")
+    if len(pw) < 6:
+        raise HTTPException(status_code=400, detail="رمز باید حداقل ۶ کاراکتر باشد")
+    if pw != rp:
+        raise HTTPException(status_code=400, detail="تکرار رمز یکسان نیست")
+    AUTH["password_hash"] = hash_password(pw)
+    AUTH["password_configured"] = True
+    await save_state()
+    token = await create_session()
+    response = JSONResponse({"ok": True, "message": "رمز تنظیم شد"})
+    set_auth_cookie(response, request, token)
+    log_activity("auth", "رمز اولیه پنل تنظیم شد", "ok")
+    return response
 
 
 @app.get(
@@ -2492,6 +2512,9 @@ async def login_page(
 async def login_form(
     request: Request,
 ):
+    if not (AUTH.get("password_configured") and AUTH.get("password_hash")):
+        return HTMLResponse(login_error_html("ابتدا از صفحه ورود، رمز اولیه را تنظیم کنید"))
+
 
     try:
 
@@ -2630,113 +2653,44 @@ async def login_form(
 
 
 @app.post("/api/login")
-async def api_login(
-    request: Request,
-):
-
+async def api_login(request: Request):
+    if not (AUTH.get("password_configured") and AUTH.get("password_hash")):
+        raise HTTPException(status_code=400, detail="ابتدا رمز پنل را در راه‌اندازی تنظیم کنید")
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="JSON نامعتبر است",
-        )
-
-    password = str(
-        body.get(
-            "password",
-            "",
-        )
-    ).strip()
-
+        raise HTTPException(status_code=400, detail="JSON نامعتبر است")
+    password = str(body.get("password", "")).strip()
+    username = str(body.get("username", "")).strip().lower()
     ip = client_ip(request)
-
     blocked, retry_after = login_is_blocked(ip)
     if blocked:
-        raise HTTPException(
-            status_code=429,
-            detail=f"ورود موقتاً مسدود است. حدود {max(1, (retry_after + 59) // 60)} دقیقه دیگر تلاش کنید.",
-            headers={"Retry-After": str(retry_after)},
-        )
-
+        raise HTTPException(status_code=429, detail=f"ورود موقتاً مسدود است. حدود {max(1, (retry_after + 59) // 60)} دقیقه دیگر تلاش کنید.", headers={"Retry-After": str(retry_after)})
     if not password:
         register_login_failure(ip)
-        raise HTTPException(
-            status_code=400,
-            detail="رمز عبور را وارد کنید",
-        )
-
-    if (
-        hash_password(password)
-        != AUTH["password_hash"]
-    ):
-
+        raise HTTPException(status_code=400, detail="رمز عبور الزامی است")
+    meta = {"role": "owner", "admin_id": None, "username": "owner"}
+    ok = False
+    if username and username not in ("owner", "admin", "root"):
+        aid, admin = find_admin_by_username(username)
+        if admin and admin.get("password_hash") == hash_password(password):
+            if not admin_is_valid(admin):
+                raise HTTPException(status_code=403, detail="حساب مسدود یا منقضی شده است")
+            ok = True
+            meta = {"role": "admin", "admin_id": aid, "username": username}
+    else:
+        if hash_password(password) == AUTH["password_hash"]:
+            ok = True
+    if not ok:
         locked, value = register_login_failure(ip)
         if locked:
-            raise HTTPException(
-                status_code=429,
-                detail="تعداد تلاش‌های ناموفق بیش از حد مجاز بود. این IP برای ۱۵ دقیقه مسدود شد.",
-                headers={"Retry-After": str(LOGIN_LOCKOUT_SECONDS)},
-            )
-
-        log_activity(
-            "auth",
-            (
-                f"تلاش ورود ناموفق از {ip}؛ "
-                f"{value} تلاش باقی مانده"
-            ),
-            "err",
-        )
-
-        raise HTTPException(
-            status_code=401,
-            detail=f"رمز عبور اشتباه است؛ {value} تلاش دیگر باقی مانده است",
-        )
-
+            raise HTTPException(status_code=429, detail="تعداد تلاش بیش از حد. ۱۵ دقیقه صبر کنید.", headers={"Retry-After": str(LOGIN_LOCKOUT_SECONDS)})
+        raise HTTPException(status_code=401, detail=f"نام کاربری یا رمز اشتباه است. {value} تلاش باقی‌مانده")
     clear_login_failures(ip)
-
-    token = await create_session()
-
-    response = JSONResponse(
-        {
-            "ok": True,
-            "authenticated": True,
-        }
-    )
-
-    set_auth_cookie(
-        response,
-        request,
-        token,
-    )
-
-    return response
-
-
-# ============================================================
-# LOGOUT
-# ============================================================
-
-@app.get("/logout")
-async def logout_page(
-    request: Request,
-):
-
-    await destroy_session(
-        request.cookies.get(
-            SESSION_COOKIE
-        )
-    )
-
-    response = RedirectResponse(
-        "/login"
-    )
-
-    response.delete_cookie(
-        SESSION_COOKIE,
-        path="/",
-    )
-
+    token = await create_session(meta)
+    response = JSONResponse({"ok": True, "role": meta["role"], "username": meta["username"]})
+    set_auth_cookie(response, request, token)
+    log_activity("auth", f"ورود موفق ({meta['username']}) از {ip}", "ok")
     return response
 
 
@@ -2765,19 +2719,7 @@ async def api_logout(
     return response
 
 
-@app.get("/api/me")
-async def api_me(
-    request: Request,
-):
 
-    return {
-        "authenticated":
-            await is_valid_session(
-                request.cookies.get(
-                    SESSION_COOKIE
-                )
-            )
-    }
 
 
 # ============================================================
@@ -3133,12 +3075,14 @@ async def create_auto_link(
         "maximum": {"ip":0,"conn":0,"speed":0,"fp":"randomized","fragment":"safe"},
     }
     cfg = profiles.get(profile, profiles["balanced"])
+    config_count = safe_int(body.get("config_count", 1), minimum=1, maximum=40)
     uid, link = await make_link(
         label=auto_config_name(), limit_bytes=0, expires_at=None,
         ip_limit=cfg["ip"], speed_limit_bytes=cfg["speed"], connection_limit=cfg["conn"],
         note=f"Auto generated by PXPanel | profile={profile}",
         protocol=protocol, fingerprint=cfg["fp"],
         alpn=DEFAULT_ALPN_BY_PROTOCOL.get(protocol, ""), port=443, fragment=cfg["fragment"],
+        config_count=config_count,
     )
     link["security_profile"] = profile
     result = {**get_link_info(link, uid, host), "ok": True, "profile": profile}
@@ -3206,13 +3150,12 @@ async def list_links(
             }
         )
 
-    result.sort(
-        key=lambda item:
-            item.get(
-                "created_at",
-                "",
-            ),
-        reverse=True,
+    result = sorted(
+        result,
+        key=lambda item: (
+            -int(item.get("sort_order") or 0),
+            str(item.get("created_at") or ""),
+        ),
     )
 
     return {
@@ -3259,6 +3202,68 @@ async def link_info_api(
 # UPDATE LINK
 # ============================================================
 
+
+
+@app.post("/api/links/reorder")
+async def reorder_links(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="JSON نامعتبر")
+    order = body.get("order") or body.get("ids") or []
+    if not isinstance(order, list):
+        raise HTTPException(400, detail="order باید آرایه باشد")
+    # first item = highest priority
+    n = len(order)
+    async with LINKS_LOCK:
+        for i, uid in enumerate(order):
+            uid = str(uid)
+            if uid in LINKS:
+                LINKS[uid]["sort_order"] = n - i
+    await save_state()
+    return {"ok": True, "count": n}
+
+
+@app.post("/api/links/bulk-delete")
+async def bulk_delete_links(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="JSON نامعتبر")
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, detail="ids خالی است")
+    deleted = []
+    for uid in ids:
+        uid = str(uid)
+        if uid in LINKS:
+            await remove_link(uid)
+            deleted.append(uid)
+    log_activity("link", f"حذف گروهی {len(deleted)} کانفیگ", "warn")
+    return {"ok": True, "deleted": len(deleted)}
+
+
+@app.post("/api/links/bulk-category")
+async def bulk_category(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="JSON نامعتبر")
+    ids = body.get("ids") or []
+    cid = str(body.get("category_id") or "0")
+    if cid not in CATEGORIES:
+        cid = "0"
+    n = 0
+    async with LINKS_LOCK:
+        for uid in ids:
+            uid = str(uid)
+            if uid in LINKS:
+                LINKS[uid]["category_id"] = cid
+                n += 1
+    await save_state()
+    return {"ok": True, "updated": n}
+
+
 @app.patch("/api/links/{uid}")
 async def update_link(
     uid: str,
@@ -3304,6 +3309,18 @@ async def update_link(
                 body["active"]
             )
 
+        if "category_id" in body:
+            cid = str(body.get("category_id") or "0")
+            if cid not in CATEGORIES:
+                cid = "0"
+            link["category_id"] = cid
+
+        if "sort_order" in body:
+            try:
+                link["sort_order"] = int(body.get("sort_order") or 0)
+            except Exception:
+                pass
+
         if "label" in body:
 
             value = str(
@@ -3330,6 +3347,7 @@ async def update_link(
                 link[
                     "used_bytes"
                 ] = 0
+
 
         if "limit_value" in body:
 
@@ -4999,7 +5017,7 @@ PX Panel
 </h1>
 
 <div class="version">
-13.6.1
+13.8.0
 </div>
 
 <div class="text">
@@ -5386,8 +5404,8 @@ async def list_categories(_=Depends(require_auth)):
 
 @app.post("/api/categories")
 async def create_category(request: Request, _=Depends(require_auth)):
-    if len(CATEGORIES) >= 10:
-        raise HTTPException(status_code=400, detail="حداکثر ۱۰ دسته‌بندی")
+    if len(CATEGORIES) >= 50:
+        raise HTTPException(status_code=400, detail="حداکثر ۵۰ گروه")
     try:
         body = await request.json()
     except Exception:
@@ -5464,8 +5482,6 @@ async def update_category(cid: str, request: Request, _=Depends(require_auth)):
 
 @app.delete("/api/categories/{cid}")
 async def delete_category(cid: str, _=Depends(require_auth)):
-    if cid in ("0", "1"):
-        raise HTTPException(status_code=400, detail="پیش‌فرض قابل حذف نیست")
     if cid not in CATEGORIES:
         raise HTTPException(status_code=404, detail="یافت نشد")
     del CATEGORIES[cid]
@@ -5806,6 +5822,426 @@ except Exception as exc:
     )
 
 
+
+# ============================================================
+
+@app.get("/api/me")
+async def api_me_info(request: Request, token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    return {
+        "ok": True,
+        "role": meta.get("role"),
+        "username": meta.get("username"),
+        "permissions": meta.get("permissions") or {p: True for p in ALL_PERMS},
+        "uptime": uptime(),
+    }
+
+
+@app.get("/api/admins")
+async def api_admins_list(token=Depends(require_perm("admins"))):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    out = []
+    for aid, a in ADMIN_ACCOUNTS.items():
+        out.append({
+            "id": aid,
+            "username": a.get("username"),
+            "label": a.get("label"),
+            "limit_bytes": int(a.get("limit_bytes") or 0),
+            "used_bytes": int(a.get("used_bytes") or 0),
+            "expires_at": a.get("expires_at"),
+            "active": bool(a.get("active", True)),
+            "blocked": bool(a.get("blocked")),
+            "permissions": a.get("permissions") or {},
+            "created_at": a.get("created_at"),
+            "valid": admin_is_valid(a),
+        })
+    out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"admins": out}
+
+
+@app.post("/api/admins")
+async def api_admins_create(request: Request, token=Depends(require_perm("admins"))):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="JSON نامعتبر")
+    username = str(body.get("username") or "").strip().lower()
+    password = str(body.get("password") or "")
+    repeat = str(body.get("repeat_password") or body.get("confirm") or "")
+    if not username or len(username) < 3:
+        raise HTTPException(400, detail="نام کاربری حداقل ۳ کاراکتر")
+    if not username.isalnum():
+        raise HTTPException(400, detail="نام کاربری فقط حروف و عدد انگلیسی")
+    if username in ("owner", "admin", "root"):
+        raise HTTPException(400, detail="این نام کاربری رزرو شده است")
+    if find_admin_by_username(username)[0]:
+        raise HTTPException(400, detail="نام کاربری تکراری است")
+    if len(password) < 6:
+        raise HTTPException(400, detail="رمز حداقل ۶ کاراکتر")
+    if password != repeat:
+        raise HTTPException(400, detail="تکرار رمز یکسان نیست")
+    limit_value = safe_float(body.get("limit_value", 0))
+    limit_unit = str(body.get("limit_unit") or "GB").upper()
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    days = safe_int(body.get("expires_days", 0), minimum=0)
+    expires_at = (datetime.now() + timedelta(days=days)).isoformat() if days > 0 else None
+    perms_in = body.get("permissions") or {}
+    permissions = {p: bool(perms_in.get(p, False)) for p in ALL_PERMS}
+    rec = default_admin_record(username, password, limit_bytes=limit_bytes, expires_at=expires_at, permissions=permissions, label=body.get("label") or username)
+    ADMIN_ACCOUNTS[rec["id"]] = rec
+    await save_state()
+    log_activity("admin", f"اکانت ادمین «{username}» ساخته شد", "ok")
+    return {"ok": True, "id": rec["id"], "username": username}
+
+
+@app.patch("/api/admins/{aid}")
+async def api_admins_patch(aid: str, request: Request, token=Depends(require_perm("admins"))):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    if aid not in ADMIN_ACCOUNTS:
+        raise HTTPException(404, detail="یافت نشد")
+    body = await request.json()
+    a = ADMIN_ACCOUNTS[aid]
+    if "blocked" in body:
+        a["blocked"] = bool(body["blocked"])
+    if "active" in body:
+        a["active"] = bool(body["active"])
+    if "label" in body:
+        a["label"] = str(body["label"])[:40]
+    if "permissions" in body and isinstance(body["permissions"], dict):
+        a["permissions"] = {p: bool(body["permissions"].get(p, False)) for p in ALL_PERMS}
+    if "limit_value" in body:
+        lv = safe_float(body.get("limit_value", 0))
+        lu = str(body.get("limit_unit") or "GB").upper()
+        a["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+    if "expires_days" in body:
+        days = safe_int(body.get("expires_days", 0), minimum=0)
+        a["expires_at"] = (datetime.now() + timedelta(days=days)).isoformat() if days > 0 else None
+    if body.get("password"):
+        pw = str(body["password"])
+        if len(pw) < 6:
+            raise HTTPException(400, detail="رمز حداقل ۶ کاراکتر")
+        a["password_hash"] = hash_password(pw)
+    await save_state()
+    log_activity("admin", f"اکانت ادمین «{a.get('username')}» ویرایش شد", "ok")
+    return {"ok": True}
+
+
+@app.delete("/api/admins/{aid}")
+async def api_admins_delete(aid: str, token=Depends(require_perm("admins"))):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    a = ADMIN_ACCOUNTS.pop(aid, None)
+    if not a:
+        raise HTTPException(404, detail="یافت نشد")
+    await save_state()
+    log_activity("admin", f"اکانت ادمین «{a.get('username')}» حذف شد", "warn")
+    return {"ok": True}
+
+
+NEWS_FILE = Path(__file__).resolve().parent / "news.json"
+
+
+@app.get("/api/news")
+async def api_news(token=Depends(require_auth)):
+    try:
+        if NEWS_FILE.exists():
+            data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
+        else:
+            data = {"enabled": False, "title": "", "message": "", "updated_at": ""}
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "enabled": False, "title": "", "message": str(e), "updated_at": ""}
+
+
+
+
+# ============================================================
+# BACKUP / RESTORE
+# ============================================================
+
+
+@app.get("/api/security/status")
+async def security_status(token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک")
+    now = time.time()
+    locked = []
+    for ip, until in list(LOGIN_LOCKED_UNTIL.items()):
+        if until > now:
+            locked.append({"ip": ip, "remaining_sec": int(until - now)})
+    return {
+        "ok": True,
+        "max_attempts": LOGIN_MAX_ATTEMPTS,
+        "window_seconds": LOGIN_WINDOW_SECONDS,
+        "lockout_seconds": LOGIN_LOCKOUT_SECONDS,
+        "locked_ips": locked,
+        "tracked_ips": len(LOGIN_FAILURES),
+    }
+
+
+@app.post("/api/security/unlock")
+async def security_unlock(request: Request, token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = str((body or {}).get("ip") or "").strip()
+    if ip:
+        LOGIN_FAILURES.pop(ip, None)
+        LOGIN_LOCKED_UNTIL.pop(ip, None)
+    else:
+        LOGIN_FAILURES.clear()
+        LOGIN_LOCKED_UNTIL.clear()
+    log_activity("auth", f"رفع مسدودی brute-force ({ip or 'all'})", "ok")
+    return {"ok": True}
+
+
+@app.get("/api/backup/users")
+async def backup_users(token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    # owner always; admin needs settings perm
+    if meta.get("role") != "owner":
+        if not (meta.get("permissions") or {}).get("settings"):
+            raise HTTPException(403, detail="دسترسی ندارید")
+    payload = {
+        "type": "pxpanel_users_backup",
+        "version": APP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "links": dict(LINKS),
+        "subs": dict(SUBS),
+        "categories": dict(CATEGORIES),
+        "admin_accounts": dict(ADMIN_ACCOUNTS),
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="pxpanel-users-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+        },
+    )
+
+
+@app.get("/api/backup/bot")
+async def backup_bot(token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        if not (meta.get("permissions") or {}).get("settings"):
+            raise HTTPException(403, detail="دسترسی ندارید")
+    data = {}
+    try:
+        if TG_FILE.exists():
+            data = json.loads(TG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    payload = {
+        "type": "pxpanel_bot_backup",
+        "version": APP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "telegram": data,
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="pxpanel-bot-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+        },
+    )
+
+
+@app.post("/api/restore/users")
+async def restore_users(request: Request, token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="فایل JSON نامعتبر")
+    if not isinstance(body, dict):
+        raise HTTPException(400, detail="فرمت نامعتبر")
+    # accept either wrapper or raw state
+    links = body.get("links")
+    if links is None and body.get("type") == "pxpanel_users_backup":
+        raise HTTPException(400, detail="لینک‌ها در بک‌آپ نیست")
+    if links is None:
+        raise HTTPException(400, detail="فایل بک‌آپ کاربران نیست")
+    if not isinstance(links, dict):
+        raise HTTPException(400, detail="links نامعتبر")
+    mode = str(body.get("mode") or "merge").lower()  # merge | replace
+    async with LINKS_LOCK:
+        if mode == "replace":
+            LINKS.clear()
+            SUBS.clear()
+            CATEGORIES.clear()
+            ADMIN_ACCOUNTS.clear()
+        LINKS.update(links)
+        if isinstance(body.get("subs"), dict):
+            SUBS.update(body["subs"])
+        if isinstance(body.get("categories"), dict):
+            CATEGORIES.update(body["categories"])
+        if isinstance(body.get("admin_accounts"), dict):
+            ADMIN_ACCOUNTS.update(body["admin_accounts"])
+        for uid, link in list(LINKS.items()):
+            if not isinstance(link, dict):
+                LINKS.pop(uid, None)
+                continue
+            link.setdefault("protocol", DEFAULT_PROTOCOL)
+            link.setdefault("fingerprint", DEFAULT_FINGERPRINT)
+            link.setdefault("used_bytes", 0)
+            link.setdefault("active", True)
+            link.setdefault("config_count", 1)
+    await save_state()
+    log_activity("backup", f"بازیابی کاربران ({mode}) — {len(links)} کانفیگ", "ok")
+    return {"ok": True, "links": len(LINKS), "subs": len(SUBS), "mode": mode}
+
+
+@app.post("/api/restore/bot")
+async def restore_bot(request: Request, token=Depends(require_auth)):
+    meta = get_session_meta(token)
+    if meta.get("role") != "owner":
+        raise HTTPException(403, detail="فقط مالک پنل")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="فایل JSON نامعتبر")
+    tg = body.get("telegram") if isinstance(body, dict) else None
+    if tg is None and isinstance(body, dict) and (body.get("token") or body.get("admin_ids") is not None):
+        tg = body
+    if not isinstance(tg, dict):
+        raise HTTPException(400, detail="فایل بک‌آپ ربات نیست")
+    # merge with existing
+    current = {}
+    try:
+        if TG_FILE.exists():
+            current = json.loads(TG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        current = {}
+    current.update({k: v for k, v in tg.items() if v is not None})
+    TG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TG_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    # try activate
+    try:
+        from telegram_bot import configure_bot, start_bot, stop_bot, setup_webhook
+        await stop_bot()
+        configure_bot(current.get("token") or "", current.get("admin_ids") or "")
+        host = get_host(request)
+        if current.get("webhook") and host and host != "localhost":
+            wh = f"https://{host}/telegram/webhook"
+            await setup_webhook(wh)
+            await start_bot(mode="webhook")
+        else:
+            await setup_webhook("")
+            await start_bot(mode="polling")
+    except Exception as exc:
+        logger.warning("restore bot activate: %s", exc)
+        log_activity("backup", f"بک‌آپ ربات ذخیره شد (فعال‌سازی: {exc})", "warn")
+        return {"ok": True, "warning": str(exc)}
+    log_activity("backup", "بازیابی تنظیمات ربات انجام شد", "ok")
+    return {"ok": True, "message": "ربات بازیابی و فعال شد"}
+
+
+
+# TELEGRAM SETTINGS API
+# ============================================================
+
+def load_tg_settings():
+    try:
+        if TG_FILE.exists():
+            return json.loads(TG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {
+        "token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+        "admin_ids": os.environ.get("TELEGRAM_ADMIN_IDS", "").strip(),
+        "webhook": False,
+        "enabled": False,
+    }
+
+
+def save_tg_settings(data: dict):
+    TG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@app.get("/api/telegram/settings")
+async def api_tg_get(_=Depends(require_auth)):
+    s = load_tg_settings()
+    token = s.get("token") or ""
+    masked = (token[:8] + "…" + token[-4:]) if len(token) > 14 else ("••••" if token else "")
+    return {
+        "token_masked": masked,
+        "has_token": bool(token),
+        "admin_ids": s.get("admin_ids") or "",
+        "webhook": bool(s.get("webhook")),
+        "enabled": bool(s.get("enabled")),
+    }
+
+
+@app.post("/api/telegram/settings")
+async def api_tg_save(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail="invalid json")
+    s = load_tg_settings()
+    token = str(body.get("token") or "").strip()
+    admin_ids = str(body.get("admin_ids") or "").strip()
+    use_webhook = bool(body.get("webhook", True))
+    if token:
+        s["token"] = token
+    if admin_ids is not None:
+        s["admin_ids"] = admin_ids
+    s["webhook"] = use_webhook
+    s["enabled"] = True
+    save_tg_settings(s)
+    # apply runtime
+    try:
+        from telegram_bot import configure_bot, start_bot, stop_bot, setup_webhook
+        await stop_bot()
+        configure_bot(s.get("token") or "", s.get("admin_ids") or "")
+        host = get_host(request)
+        if use_webhook and host and host != "localhost":
+            wh = f"https://{host}/telegram/webhook"
+            ok = await setup_webhook(wh)
+            s["webhook_url"] = wh
+            s["webhook_ok"] = bool(ok)
+            save_tg_settings(s)
+            await start_bot(mode="webhook")
+        else:
+            await setup_webhook("")  # delete webhook -> polling
+            await start_bot(mode="polling")
+        log_activity("telegram", "ربات تلگرام پیکربندی و فعال شد", "ok")
+        return {"ok": True, "webhook": use_webhook, "message": "ربات فعال شد"}
+    except Exception as exc:
+        logger.warning("telegram activate error: %s", exc)
+        return {"ok": True, "warning": str(exc), "message": "تنظیمات ذخیره شد"}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        from telegram_bot import process_update
+        data = await request.json()
+        await process_update(data)
+    except Exception as exc:
+        logger.warning("webhook error: %s", exc)
+    return {"ok": True}
+
+
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -5981,3282 +6417,1281 @@ async def http_proxy(
 
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
-
-<html lang="fa" dir="rtl">
-
+<html lang="fa" dir="rtl" id="htmlRoot">
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1"
-/>
-
-<title>
-PX Panel 13.6.1
-</title>
-
-<link
-rel="preconnect"
-href="https://fonts.googleapis.com"
->
-
-<link
-rel="preconnect"
-href="https://fonts.gstatic.com"
-crossorigin
->
-
-<link
-href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800;900&display=swap"
-rel="stylesheet"
->
-
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>PXPanel 13.8.0</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-
-*{
-    box-sizing:border-box;
-}
-
-html,
-body{
-    margin:0;
-    min-height:100%;
-}
-*::-webkit-scrollbar{width:6px;height:6px}
-*::-webkit-scrollbar-track{background:transparent}
-*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
-*::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
-*{scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.12) transparent}
-
-
-body{
-    min-height:100vh;
-
-    color:#fff;
-
-    font-family:"Vazirmatn",sans-serif;
-
-    background:
-        radial-gradient(
-            circle at 10% 0%,
-            rgba(37,99,235,.13),
-            transparent 25%
-        ),
-        radial-gradient(
-            circle at 100% 100%,
-            rgba(59,130,246,.10),
-            transparent 25%
-        ),
-        #07070a;
-}
-
-.wrapper{
-    width:min(
-        1280px,
-        calc(100% - 24px)
-    );
-
-    margin:auto;
-    padding:18px 0 50px;
-}
-
-.topbar{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:12px;
-
-    margin-bottom:15px;
-}
-
-.brand{
-    display:flex;
-    align-items:center;
-    gap:11px;
-}
-
-.logo{
-    width:44px;
-    height:44px;
-
-    display:flex;
-    align-items:center;
-    justify-content:center;
-
-    border-radius:14px;
-
-    font-weight:900;
-
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #3b82f6
-        );
-}
-
-.brand-name{
-    font-size:16px;
-    font-weight:900;
-}
-
-.brand-desc{
-    margin-top:2px;
-    color:rgba(255,255,255,.37);
-    font-size:10px;
-}
-
-.brand-version{
-    color:#60a5fa;
-    font-size:9px;
-    margin-top:2px;
-}
-
-.top-actions{
-    display:flex;
-    gap:7px;
-    flex-wrap:wrap;
-}
-
-.top-btn{
-    border:1px solid rgba(255,255,255,.08);
-
-    padding:9px 12px;
-
-    border-radius:11px;
-
-    color:#fff;
-    background:rgba(255,255,255,.035);
-
-    font-family:"Vazirmatn",sans-serif;
-
-    font-size:10px;
-    cursor:pointer;
-    text-decoration:none;
-}
-
-.top-btn.primary{
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #3b82f6
-        );
-}
-
-.top-btn.danger{
-    color:#fca5a5;
-}
-
-.stats-grid{
-    display:grid;
-    grid-template-columns:
-        repeat(6,1fr);
-
-    gap:9px;
-}
-
-.stat{
-    position:relative;
-    overflow:hidden;
-    padding:14px;
-    border-radius:16px;
-
-    border:
-        1px solid
-        rgba(255,255,255,.07);
-
-    background:
-        rgba(255,255,255,.03);
-}
-
-.stat-label{
-    color:rgba(255,255,255,.35);
-    font-size:9px;
-}
-
-.stat-value{
-    margin-top:6px;
-
-    font-size:19px;
-    font-weight:900;
-}
-.stat::after{content:"";position:absolute;right:0;bottom:0;left:0;height:2px;background:var(--stat-color,#60a5fa);opacity:.8}
-.stat:nth-child(1){--stat-color:#60a5fa}.stat:nth-child(2){--stat-color:#4ade80}.stat:nth-child(3){--stat-color:#f59e0b}.stat:nth-child(4){--stat-color:#60a5fa}.stat:nth-child(5){--stat-color:#fb7185}.stat:nth-child(6){--stat-color:#22d3ee}.stat-value{color:var(--stat-color,#fff)}
-
-
-.panel{
-    margin-top:11px;
-
-    overflow:hidden;
-
-    border-radius:19px;
-
-    border:
-        1px solid
-        rgba(255,255,255,.07);
-
-    background:
-        rgba(255,255,255,.03);
-}
-
-.panel-head{
-    padding:14px 16px;
-
-    display:flex;
-
-    justify-content:space-between;
-    align-items:center;
-
-    gap:10px;
-
-    border-bottom:
-        1px solid
-        rgba(255,255,255,.06);
-}
-
-.panel-title{
-    font-size:12px;
-    font-weight:800;
-}
-
-.panel-sub{
-    color:rgba(255,255,255,.32);
-    font-size:9px;
-    margin-top:3px;
-}
-
-.table-wrap{
-    overflow:auto;
-}
-
-table{
-    width:100%;
-
-    min-width:1120px;
-
-    border-collapse:collapse;
-}
-
-th,
-td{
-    text-align:right;
-
-    padding:12px 13px;
-
-    border-bottom:
-        1px solid
-        rgba(255,255,255,.045);
-
-    font-size:10px;
-}
-
-th{
-    color:rgba(255,255,255,.32);
-    font-weight:500;
-}
-
-.badge{
-    display:inline-flex;
-
-    padding:4px 8px;
-
-    border-radius:999px;
-
-    font-size:8px;
-}
-
-.badge.active{
-    color:#86efac;
-    background:rgba(34,197,94,.08);
-}
-
-.badge.off{
-    color:#fca5a5;
-    background:rgba(239,68,68,.08);
-}
-
-.actions{
-    display:flex;
-    flex-wrap:wrap;
-    gap:4px;
-}
-
-.action{
-    border:0;
-
-    padding:6px 8px;
-
-    border-radius:8px;
-
-    color:rgba(255,255,255,.82);
-
-    background:rgba(255,255,255,.05);
-
-    font-family:"Vazirmatn",sans-serif;
-
-    font-size:8px;
-
-    cursor:pointer;
-}
-
-.action.primary{
-    background:
-        rgba(37,99,235,.18);
-}
-
-.action.danger{
-    color:#fca5a5;
-}
-
-.url-box{
-    max-width:280px;
-
-    direction:ltr;
-    text-align:left;
-
-    white-space:nowrap;
-    overflow:hidden;
-    text-overflow:ellipsis;
-
-    color:#93c5fd;
-
-    font-family:Consolas,monospace;
-
-    font-size:8px;
-}
-
-.pre{
-    margin:0;
-
-    padding:15px;
-
-    max-height:280px;
-
-    overflow:auto;
-
-    color:rgba(255,255,255,.45);
-
-    font-family:Consolas,monospace;
-
-    font-size:9px;
-
-    white-space:pre-wrap;
-}
-
-.download-grid{
-    display:grid;
-
-    grid-template-columns:
-        repeat(3,1fr);
-
-    gap:8px;
-
-    padding:14px;
-}
-
-.download{
-    display:block;
-
-    padding:11px;
-
-    border-radius:12px;
-
-    color:#fff;
-    text-decoration:none;
-
-    border:
-        1px solid
-        rgba(255,255,255,.06);
-
-    background:
-        rgba(255,255,255,.025);
-
-    font-size:10px;
-}
-
-.download span{
-    display:block;
-
-    margin-top:3px;
-
-    color:rgba(255,255,255,.34);
-
-    font-size:8px;
-}
-
-.notice{
-    margin:0 14px 14px;
-
-    padding:14px;
-
-    border-radius:13px;
-
-    background:
-        rgba(37,99,235,.06);
-
-    border:
-        1px solid
-        rgba(37,99,235,.13);
-
-    color:rgba(255,255,255,.62);
-
-    line-height:1.9;
-
-    font-size:10px;
-}
-
-.notice strong{
-    color:#93c5fd;
-}
-
-.empty{
-    padding:25px;
-
-    text-align:center;
-
-    color:rgba(255,255,255,.30);
-
-    font-size:11px;
-}
-
-.modal-backdrop{
-    position:fixed;
-
-    inset:0;
-
-    z-index:100;
-
-    display:none;
-
-    align-items:center;
-    justify-content:center;
-
-    padding:15px;
-
-    background:
-        rgba(0,0,0,.62);
-
-    backdrop-filter:blur(12px);
-}
-
-.modal-backdrop.open{
-    display:flex;
-}
-
-.modal{
-    width:100%;
-    max-width:720px;
-
-    max-height:
-        calc(100vh - 30px);
-
-    overflow:auto;
-
-    padding:20px;
-
-    border-radius:22px;
-
-    background:#0d0d12;
-
-    border:
-        1px solid
-        rgba(255,255,255,.08);
-
-    box-shadow:
-        0 30px 100px
-        rgba(0,0,0,.55);
-}
-
-.modal-head{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-
-    margin-bottom:15px;
-}
-
-.modal-title{
-    font-size:14px;
-    font-weight:800;
-}
-
-.close{
-    width:34px;
-    height:34px;
-
-    border:0;
-    border-radius:10px;
-
-    color:#fff;
-    background:rgba(255,255,255,.05);
-
-    cursor:pointer;
-}
-
-.form-grid{
-    display:grid;
-
-    grid-template-columns:
-        repeat(2,1fr);
-
-    gap:9px;
-}
-
-.field{
-    display:flex;
-    flex-direction:column;
-    gap:6px;
-}
-
-.field.full{
-    grid-column:
-        1 / -1;
-}
-
-.field label{
-    color:rgba(255,255,255,.4);
-    font-size:9px;
-}
-
-.field input,
-.field select,
-.field textarea{
-    width:100%;
-
-    padding:11px;
-
-    border-radius:11px;
-
-    border:
-        1px solid
-        rgba(255,255,255,.07);
-
-    background:
-        rgba(255,255,255,.035);
-
-    color:#fff;
-
-    outline:none;
-
-    font-family:
-        "Vazirmatn",
-        sans-serif;
-
-    font-size:10px;
-}
-
-.field textarea{
-    min-height:90px;
-    resize:vertical;
-}
-
-.field input:focus,
-.field select:focus,
-.field textarea:focus{
-    border-color:
-        rgba(37,99,235,.55);
-}
-
-.modal-actions{
-    margin-top:15px;
-
-    display:flex;
-
-    gap:8px;
-}
-
-.modal-btn{
-    flex:1;
-
-    padding:11px;
-
-    border:0;
-    border-radius:11px;
-
-    cursor:pointer;
-
-    font-family:
-        "Vazirmatn",sans-serif;
-
-    color:#fff;
-}
-
-.modal-btn.primary{
-    background:
-        linear-gradient(
-            135deg,
-            #2563eb,
-            #3b82f6
-        );
-}
-
-.modal-btn.secondary{
-    background:
-        rgba(255,255,255,.05);
-}
-
-.toast{
-    position:fixed;
-
-    left:50%;
-    top:18px;
-    bottom:auto;
-
-    z-index:200;
-
-    padding:11px 14px;
-
-    border-radius:12px;
-
-    background:rgba(20,20,27,.97);
-
-    border:
-        1px solid
-        rgba(255,255,255,.08);
-
-    color:#fff;
-
-    font-size:11px;
-    font-weight:700;
-
-    opacity:0;
-
-    transform:
-        translate(-50%,-140%);
-
-    pointer-events:none;
-
-    transition:
-        .2s ease;
-}
-
-.toast.show{
-    opacity:1;
-
-    transform:
-        translate(-50%,0);
-}
-
-/* LOGIN NOTICE START — DELETE THIS WHOLE BLOCK TO DISABLE THE LOGIN NOTICE */
-.login-notice-backdrop{position:fixed;inset:0;z-index:500;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.72);backdrop-filter:blur(14px)}
-.login-notice{width:min(620px,100%);max-height:calc(100vh - 32px);overflow:auto;padding:22px;border:1px solid rgba(255,255,255,.10);border-radius:24px;background:linear-gradient(180deg,rgba(24,24,34,.98),rgba(12,12,17,.98));box-shadow:0 30px 100px rgba(0,0,0,.60);animation:noticeIn .28s ease both}
-.login-notice-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}.login-notice-icon{width:42px;height:42px;display:flex;align-items:center;justify-content:center;border-radius:13px;background:rgba(37,99,235,.14);border:1px solid rgba(129,140,248,.22);color:#93c5fd;font-size:18px}.login-notice h3{margin:0;font-size:15px}.login-notice p{margin:5px 0 0;color:rgba(255,255,255,.42);font-size:9px;line-height:1.9}.notice-downloads{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}.notice-download{display:block;padding:12px;border-radius:14px;text-decoration:none;color:#fff;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);transition:.2s ease}.notice-download:hover{transform:translateY(-2px);border-color:rgba(129,140,248,.30);background:rgba(129,140,248,.07)}.notice-download strong{display:block;font-size:10px}.notice-download span{display:block;margin-top:3px;color:rgba(255,255,255,.36);font-size:8px}.login-notice-body{margin-top:14px;padding:14px;border-radius:14px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.62);font-size:10px;line-height:2}.login-notice-body b{color:#fff}.login-notice-actions{margin-top:14px;display:flex;gap:8px}.login-notice-actions button{flex:1;padding:11px;border:0;border-radius:12px;color:#fff;background:linear-gradient(135deg,#2563eb,#3b82f6);font-family:inherit;cursor:pointer}@keyframes noticeIn{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
-/* LOGIN NOTICE END */
-
-/* REGION NOTICE + RESPONSIVE UI OVERRIDES */
-.login-notice-backdrop{
-    padding:clamp(10px,3vw,24px);
-    background:rgba(3,4,9,.76);
-    backdrop-filter:blur(18px) saturate(135%);
-}
-.login-notice{
-    width:min(680px,100%);
-    max-height:min(760px,calc(100vh - 24px));
-    padding:clamp(16px,3vw,24px);
-    border-radius:24px;
-    border:1px solid rgba(96,165,250,.18);
-    background:
-        radial-gradient(circle at 90% 0%,rgba(37,99,235,.13),transparent 32%),
-        linear-gradient(180deg,rgba(25,25,37,.98),rgba(11,11,16,.99));
-    box-shadow:0 35px 110px rgba(0,0,0,.62),inset 0 1px rgba(255,255,255,.04);
-}
-.login-notice-head{align-items:flex-start}
-.login-notice-icon{
-    width:46px;height:46px;min-width:46px;border-radius:15px;
-    display:flex;align-items:center;justify-content:center;
-    background:rgba(37,99,235,.12);
-    border:1px solid rgba(96,165,250,.22);
-    color:#93c5fd;
-}
-.login-notice-icon svg{width:24px;height:24px;display:block}
-.login-notice h3{font-size:15px;letter-spacing:-.2px}
-.login-notice p{font-size:10px;line-height:2;color:rgba(255,255,255,.46)}
-.login-notice-body{
-    margin-top:12px;
-    padding:15px;
-    border-radius:16px;
-    background:rgba(37,99,235,.065);
-    border:1px solid rgba(129,140,248,.14);
-    color:rgba(255,255,255,.66);
-    font-size:10px;
-    line-height:2.15;
-}
-.login-notice-body b{color:#fff}
-.region-warning{
-    margin-top:10px;
-    padding:13px 14px;
-    border-radius:15px;
-    border:1px solid rgba(251,191,36,.17);
-    background:rgba(251,191,36,.055);
-    color:rgba(255,255,255,.72);
-    line-height:2.1;
-}
-.region-warning .warning-title{
-    display:flex;align-items:center;gap:8px;
-    color:#fcd34d;font-weight:800;margin-bottom:3px;
-}
-.region-warning svg{width:17px;height:17px;flex:none}
-.notice-downloads{grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
-.notice-download{min-width:0}
-.notice-download strong{font-size:10px}
-.login-notice-actions button{min-height:42px;display:flex;align-items:center;justify-content:center;gap:7px}.login-notice-actions button svg{width:16px;height:16px}
-
-.top-actions{display:flex;align-items:center;justify-content:flex-start;gap:8px;flex-wrap:wrap}
-.top-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
-.top-btn svg{width:15px;height:15px;flex:none}
-.wrapper{width:min(1180px,calc(100% - 28px));margin-inline:auto}
-.footer{margin-top:22px;padding:12px 2px 4px;opacity:.72}
-
-@media(max-width:760px){
-    .wrapper{width:calc(100% - 20px)}
-    .topbar{gap:12px}
-    .top-actions{width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
-    .top-btn{width:100%;min-height:40px;padding:9px 10px}
-    .top-btn.danger{grid-column:1 / -1}
-    .notice-downloads{grid-template-columns:1fr}
-    .login-notice{border-radius:20px}
-}
-@media(max-width:430px){
-    .top-actions{grid-template-columns:1fr 1fr}
-    .brand-name{font-size:15px}
-    .brand-desc{font-size:9px}
-    .stats-grid{grid-template-columns:1fr 1fr!important}
-    .login-notice-head{gap:9px}
-    .login-notice-icon{width:40px;height:40px;min-width:40px}
-    .login-notice h3{font-size:14px}
-}
-
-@media(prefers-reduced-motion:reduce){
-    .login-notice{animation:none}
-    .notice-download{transition:none}
-}
-
-@media(max-width:1100px){
-
-    .stats-grid{
-        grid-template-columns:
-            repeat(3,1fr);
-    }
-
-    .download-grid{
-        grid-template-columns:
-            repeat(2,1fr);
-    }
-}
-
-@media(max-width:700px){
-
-    .wrapper{
-        width:
-            calc(100% - 14px);
-    }
-
-    .topbar{
-        align-items:
-            flex-start;
-
-        flex-direction:
-            column;
-    }
-
-    .stats-grid{
-        grid-template-columns:
-            repeat(2,1fr);
-    }
-
-    .form-grid{
-        grid-template-columns:1fr;
-    }
-
-    .field.full{
-        grid-column:auto;
-    }
-
-    .download-grid{
-        grid-template-columns:1fr;
-    }
-}
-
+:root{
+  --bg:#06060b;--bg2:#0b0b12;--bg3:#12121c;--card:rgba(18,18,28,.92);--card-b:rgba(255,255,255,.08);
+  --accent:#3b82f6;--accent2:#60a5fa;--purple:#8b5cf6;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
+  --t1:#f8fafc;--t2:rgba(248,250,252,.72);--t3:rgba(248,250,252,.42);
+  --sb:252px;--sb-c:74px;--radius:18px;--shadow:0 12px 40px rgba(0,0,0,.45);
+  --input-bg:rgba(0,0,0,.4);--hover:rgba(59,130,246,.12);
+  --glow:0 0 40px rgba(59,130,246,.12);--glass:blur(16px);
+}
+html.light{
+  --bg:#eef1f8;--bg2:#ffffff;--bg3:#f1f4fa;--card:#ffffff;--card-b:rgba(15,23,42,.09);
+  --accent:#2563eb;--accent2:#3b82f6;--purple:#7c3aed;--green:#16a34a;--red:#dc2626;--amber:#d97706;
+  --t1:#0f172a;--t2:#475569;--t3:#94a3b8;
+  --shadow:0 10px 32px rgba(15,23,42,.08);
+  --input-bg:#f8fafc;--hover:rgba(37,99,235,.08);
+  --glow:0 0 32px rgba(37,99,235,.08);--glass:blur(12px);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%}
+body{font-family:'Vazirmatn',sans-serif;background:var(--bg);color:var(--t1);display:flex;min-height:100vh;overflow-x:hidden;transition:background .3s,color .3s}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 80% 50% at 100% 0%, rgba(59,130,246,.14), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(139,92,246,.10), transparent 45%);
+}
+html.light body::before{
+  background:
+    radial-gradient(ellipse 80% 50% at 100% 0%, rgba(37,99,235,.08), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(124,58,237,.06), transparent 45%);
+}
+.sidebar,.main,.mob-bar,.modal-bg,.toast{position:relative;z-index:1}
+.sidebar{z-index:300}.mob-bar{z-index:250}.modal-bg{z-index:500}.toast{z-index:999}
+body.en{font-family:'Inter',system-ui,sans-serif}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:var(--t3);border-radius:99px}
+
+.sidebar{position:fixed;right:0;top:0;bottom:0;width:var(--sb);background:var(--bg2);border-left:1px solid var(--card-b);display:flex;flex-direction:column;z-index:300;transition:width .28s cubic-bezier(.4,0,.2,1),transform .28s,background .3s;box-shadow:var(--shadow);backdrop-filter:var(--glass)}
+.sidebar.collapsed{width:var(--sb-c)}
+.sb-toggle{position:absolute;left:-15px;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:8px;background:var(--accent);border:2px solid var(--bg);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:310;box-shadow:0 4px 14px rgba(37,99,235,.4);transition:.2s}
+.sb-toggle:hover{filter:brightness(1.1);transform:translateY(-50%) scale(1.05)}
+.sb-toggle svg{width:14px;height:14px;transition:transform .28s}
+.sidebar.collapsed .sb-toggle svg{transform:rotate(180deg)}
+.sb-logo{display:flex;align-items:center;gap:12px;padding:20px 16px;border-bottom:1px solid var(--card-b)}
+.sb-logo-icon{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff;flex-shrink:0;box-shadow:0 4px 14px rgba(59,130,246,.35)}
+.sb-logo-text{overflow:hidden;white-space:nowrap}
+.sb-logo-name{font-size:15px;font-weight:800;letter-spacing:-.02em}
+.sb-logo-ver{font-size:10px;color:var(--t3);margin-top:2px}
+.sidebar.collapsed .sb-logo-text,
+.sidebar.collapsed .nav-label,
+.sidebar.collapsed .nav-sec,
+.sidebar.collapsed .sb-foot span{display:none!important}
+.sidebar.collapsed .sb-logo{justify-content:center;padding:16px 8px}
+.sidebar.collapsed .sb-logo-icon{margin:0 auto}
+.nav{flex:1;overflow-y:auto;padding:10px 0}
+.nav-sec{padding:14px 18px 6px;font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--t3);font-weight:700}
+.nav-item{display:flex;align-items:center;gap:11px;padding:11px 16px;margin:2px 10px;border-radius:12px;color:var(--t3);cursor:pointer;transition:.15s;border:none;background:transparent;width:calc(100% - 20px);font-family:inherit;font-size:13px;font-weight:500}
+.nav-item svg{width:18px;height:18px;min-width:18px;min-height:18px;flex-shrink:0;display:block}
+.nav-item:hover{background:var(--hover);color:var(--t2)}
+.nav-item.on{background:var(--hover);color:var(--accent2);font-weight:700;box-shadow:inset -3px 0 0 var(--accent)}
+.sidebar.collapsed .nav-item{justify-content:center;align-items:center;padding:12px 0;margin:3px 10px;width:calc(100% - 20px);gap:0}
+.sidebar.collapsed .nav-item svg{margin:0 auto}
+.sidebar.collapsed .nav-item.on{box-shadow:none}
+.sidebar.collapsed .sb-foot button,.sidebar.collapsed .sb-foot a.btn{padding:10px 0;gap:0}
+.sidebar.collapsed .sb-foot button svg,.sidebar.collapsed .sb-foot a.btn svg{margin:0 auto;display:block}
+.sb-foot{padding:12px;border-top:1px solid var(--card-b);display:flex;flex-direction:column;gap:7px}
+.sb-foot button,.sb-foot a.btn{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px;border-radius:11px;border:1px solid var(--card-b);background:var(--bg3);color:var(--t2);cursor:pointer;font-family:inherit;font-size:12px;width:100%;text-decoration:none;font-weight:600;transition:.15s}
+.sb-foot button:hover,.sb-foot a.btn:hover{background:var(--hover);color:var(--t1)}
+.sb-foot a.danger{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.2);color:var(--red)}
+
+.main{margin-right:var(--sb);flex:1;min-width:0;padding:28px 24px 60px;transition:margin .28s}
+.main.expanded{margin-right:var(--sb-c)}
+.page{display:none;animation:fadeIn .25s ease}
+.page.on{display:block}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.page-head{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:14px;margin-bottom:22px}
+.page-title{font-size:20px;font-weight:800;display:flex;align-items:center;gap:10px;letter-spacing:-.02em}
+.page-title svg{width:22px;height:22px;color:var(--accent2)}
+.page-sub{font-size:12px;color:var(--t3);margin-top:5px}
+
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.metric{background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);transition:.25s;backdrop-filter:var(--glass)}
+.metric:hover{border-color:rgba(59,130,246,.25)}
+.metric-label{font-size:11px;color:var(--t3);margin-bottom:8px;display:flex;align-items:center;gap:6px;font-weight:600}
+.metric-val{font-size:24px;font-weight:800;letter-spacing:-.03em}
+.card{background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);padding:20px;margin-bottom:14px;box-shadow:var(--shadow);backdrop-filter:var(--glass);transition:border-color .2s,box-shadow .2s}
+.card-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card-title svg{width:16px;height:16px;color:var(--accent2)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.action-card{cursor:pointer;transition:.2s;border:1px solid var(--card-b)}
+.action-card:hover{border-color:rgba(59,130,246,.4);transform:translateY(-2px);box-shadow:0 12px 28px rgba(59,130,246,.12)}
+.action-card.purple:hover{border-color:rgba(139,92,246,.45)}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 16px;border-radius:11px;border:1px solid var(--card-b);background:var(--bg3);color:var(--t2);cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;transition:.15s}
+.btn:hover{color:var(--t1);border-color:var(--accent)}
+.btn-p{background:linear-gradient(135deg,#3b82f6,#6366f1);border:none;color:#fff;box-shadow:0 6px 20px rgba(59,130,246,.35)}
+.btn-p:hover{filter:brightness(1.08);color:#fff}
+.btn-d{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.25);color:var(--red)}
+.btn-sm{padding:7px 11px;font-size:11px;border-radius:9px}
+.btn svg{width:15px;height:15px}
+
+.table-wrap{overflow-x:auto;border-radius:14px;border:1px solid var(--card-b)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:right;padding:12px 14px;background:var(--bg3);color:var(--t3);font-weight:700;white-space:nowrap}
+td{padding:12px 14px;border-top:1px solid var(--card-b);vertical-align:middle}
+tr:hover td{background:var(--hover)}
+.ops{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+
+.range-tabs{display:flex;gap:4px;background:var(--bg3);padding:4px;border-radius:12px;border:1px solid var(--card-b)}
+.range-tab{padding:7px 13px;border-radius:9px;font-size:11px;font-weight:700;color:var(--t3);cursor:pointer;border:none;background:transparent;font-family:inherit;transition:.15s}
+.range-tab.on{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.35)}
+
+.field{margin-bottom:14px}
+.field label{display:block;font-size:11px;color:var(--t3);margin-bottom:6px;font-weight:700}
+.field input,.field select,.field textarea{width:100%;padding:11px 13px;border-radius:11px;border:1px solid var(--card-b);background:var(--input-bg);color:var(--t1);font-family:inherit;font-size:13px;outline:none;transition:.15s}
+.field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+
+.support-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.support-tile{display:flex;align-items:center;gap:14px;padding:20px;background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);text-decoration:none;color:inherit;transition:.2s;box-shadow:var(--shadow)}
+.support-tile:hover{border-color:rgba(59,130,246,.35);transform:translateY(-3px)}
+.support-icon{width:48px;height:48px;border-radius:14px;background:var(--hover);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.support-icon svg{width:22px;height:22px;color:var(--accent2)}
+.support-label{font-size:11px;color:var(--t3);font-weight:600}
+.support-val{font-size:13px;font-weight:700;margin-top:3px}
+
+.log-item{padding:12px 0;border-bottom:1px solid var(--card-b);font-size:12px;display:flex;gap:12px;align-items:flex-start}
+.log-time{color:var(--t3);font-size:10px;white-space:nowrap;min-width:72px;font-weight:600}
+.log-msg{color:var(--t2);flex:1;line-height:1.5}
+
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);z-index:500;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-bg.open{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--card-b);border-radius:20px;width:min(520px,100%);max-height:90vh;overflow-y:auto;padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.4)}
+.modal-title{font-size:17px;font-weight:800;margin-bottom:16px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap}
+.link-box{background:var(--input-bg);border:1px solid var(--card-b);border-radius:12px;padding:12px;font-size:11px;word-break:break-all;color:var(--t2);margin:8px 0 12px;font-family:ui-monospace,monospace;line-height:1.6;max-height:90px;overflow:auto}
+
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(90px);background:var(--bg2);border:1px solid var(--card-b);color:var(--t1);padding:13px 22px;border-radius:14px;font-size:13px;font-weight:600;z-index:999;opacity:0;transition:.3s;pointer-events:none;box-shadow:var(--shadow)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+.switch{position:relative;display:inline-block;width:44px;height:26px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;inset:0;background:rgba(148,163,184,.35);border-radius:26px;transition:.2s}
+.slider:before{position:absolute;content:"";height:20px;width:20px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 2px 6px rgba(0,0,0,.2)}
+.switch input:checked+.slider{background:var(--green)}
+.switch input:checked+.slider:before{transform:translateX(18px)}
+
+.mob-bar{display:none;position:fixed;top:0;left:0;right:0;height:56px;background:var(--bg2);border-bottom:1px solid var(--card-b);z-index:250;align-items:center;justify-content:space-between;padding:0 16px;box-shadow:var(--shadow)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:290;display:none}
+.overlay.show{display:block}
+
+@media(max-width:900px){
+  .sidebar{transform:translateX(100%)}
+  .sidebar.open{transform:translateX(0)}
+  .sb-toggle{display:none!important}
+  .main,.main.expanded{margin-right:0;padding-top:72px}
+  .mob-bar{display:flex}
+  .metrics{grid-template-columns:1fr 1fr}
+  .g2,.form-row{grid-template-columns:1fr}
+}
+@media(max-width:480px){.metrics{grid-template-columns:1fr}}
+.spin{width:36px;height:36px;border:3px solid var(--card-b);border-top-color:var(--accent);border-radius:50%;margin:0 auto;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.conn-badge{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:20px;padding:0 7px;border-radius:8px;font-size:10px;font-weight:800}
+.conn-badge.green{background:rgba(34,197,94,.18);color:#4ade80}
+.conn-badge.gray{background:rgba(148,163,184,.15);color:#94a3b8}
+.conn-badge.orange{background:rgba(245,158,11,.18);color:#fbbf24}
+.conn-badge.red{background:rgba(239,68,68,.18);color:#f87171}
+.spin{width:36px;height:36px;border:3px solid var(--card-b);border-top-color:var(--accent);border-radius:50%;margin:0 auto;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
-
 </head>
-
 <body>
 
-<div class="wrapper">
-
-<div class="topbar">
-
-<div class="brand">
-
-<div class="logo">
-P
-</div>
-
-<div>
-
-<div class="brand-name">
-PX Panel
-</div>
-
-<div class="brand-desc">
-داشبورد مدیریت سرویس
-</div>
-<div class="brand-version">13.6.1</div>
-<div style="margin-top:5px;font-size:10px;display:flex;align-items:center;gap:6px">
-<svg width="14" height="14" viewBox="0 0 24 24" fill="#ff0000"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 0 0 .5 6.2 31.5 31.5 0 0 0 0 12a31.5 31.5 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 0 0 2.1-2.1A31.5 31.5 0 0 0 24 12a31.5 31.5 0 0 0-.5-5.8zM9.75 15.5v-7l6.5 3.5-6.5 3.5z"/></svg>
-<a href="https://www.youtube.com/@LogicSec_YT" target="_blank" rel="noopener" style="color:#93c5fd;text-decoration:none">LogicSec_YT</a>
-</div>
-
-</div>
-
-</div>
-
-<div class="top-actions">
-
-<button class="top-btn primary" onclick="openAutoModal()" title="ساخت خودکار" style="min-width:44px">
-<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="8" width="18" height="12" rx="2"/><circle cx="12" cy="14" r="2"/><path d="M8 8V6a4 4 0 0 1 8 0v2"/></svg>
-</button>
-<button class="top-btn" onclick="openManualModal()" title="ساخت دستی" style="min-width:44px">
-<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 5v14M5 12h14"/></svg>
-</button>
-<button class="top-btn" onclick="openCategoryModal()" title="دسته‌بندی" style="min-width:44px">
-<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h16M4 12h10M4 18h14"/></svg>
-</button>
-<button class="top-btn" onclick="openMixModal()" title="مخلوط‌سازی کانفیگ‌ها" style="min-width:44px;background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.35);color:#fca5a5">
-<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
-</button>
-
-<button
-class="top-btn"
-onclick="openPasswordModal()"
-><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-تغییر رمز
-</button>
-
-<a
-href="/logout"
-class="top-btn danger"
-><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 5H5v14h5"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg>
-خروج
-</a>
-
-</div>
-
-</div>
-
-
-<div class="stats-grid">
-
-<div class="stat">
-<div class="stat-label">
-کل کانفیگ‌ها
-</div>
-<div
-id="totalLinks"
-class="stat-value"
->
--
-</div>
-</div>
-
-<div class="stat">
-<div class="stat-label">
-فعال
-</div>
-<div
-id="activeLinks"
-class="stat-value"
->
--
-</div>
-</div>
-
-<div class="stat">
-<div class="stat-label">
-اتصالات
-</div>
-<div
-id="connections"
-class="stat-value"
->
--
-</div>
-</div>
-
-<div class="stat">
-<div class="stat-label">
-ترافیک مصرفی
-</div>
-<div
-id="traffic"
-class="stat-value"
->
--
-</div>
-</div>
-
-<div class="stat">
-<div class="stat-label">
-ریکویست
-</div>
-<div
-id="requests"
-class="stat-value"
->
--
-</div>
-</div>
-
-<div class="stat">
-<div class="stat-label">
-تایم فعال بودن
-</div>
-<div
-id="uptime"
-class="stat-value"
->
--
-</div>
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<div class="panel-head">
-
-<div>
-
-<div class="panel-title">
-مدیریت کانفیگ‌هـا
-</div>
-
-<div class="panel-sub" style="display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 0.75rem; color: rgba(255, 255, 255, 0.6); padding: 12px; text-align: center; direction: rtl;">
-  <span style="opacity: 0.8;">پشتیبانــی:</span>
-  <a href="https://t.me/logictop12" target="_blank" rel="noopener noreferrer" style="font-weight: 500; color: #34d399; text-decoration: none; transition: color 0.2s ease;" onmouseover="this.style.color='#6ee7b7'; this.style.textDecoration='underline';" onmouseout="this.style.color='#34d399'; this.style.textDecoration='none';">
-    @logictop12
-  </a>
-</div>
-
-</div>
-
-<button
-class="top-btn primary"
-onclick="refresh()"
->
-↻ بروزرسانـی
-</button>
-
-</div>
-
-<div class="table-wrap">
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>دسته</th>
-<th>
-نـام
-</th>
-
-<th>
-پروتـکل
-</th>
-
-<th>
-وضعیـت
-</th>
-
-<th>
-مصـرف
-</th>
-
-<th>
-زمـان
-</th>
-
-<th>
-اتصـال
-</th>
-
-<th>
-VLESS
-</th>
-
-<th>
-عملیـات
-</th>
-
-</tr>
-
-</thead>
-
-<tbody id="linksTable">
-
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<div class="panel-head">
-
-<div>
-<div class="panel-title">آخرین فعالیت‌ها</div>
-<div class="panel-sub">لاگ زنده سیستم · حداکثر ۱۵۰ رویداد</div>
-</div>
-
-<button class="top-btn" onclick="refresh()" style="font-size:10px">↻ بروزرسانی</button>
-
-</div>
-
-<div id="logs" style="padding:10px 12px;max-height:340px;overflow:auto">
-<div style="text-align:center;color:rgba(255,255,255,.3);padding:24px;font-size:11px">در حال بارگذاری...</div>
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<div class="panel-head">
-
-<div>
-<div class="panel-title">
-دانلود برنامه اتصــال
-</div>
-
-<div class="panel-sub">
-Android / iPhone / iPad / Windows
-</div>
-
-</div>
-
-</div>
-
-<div class="download-grid">
-
-<a
-class="download"
-href="https://play.google.com/store/apps/details?id=com.happproxy"
-target="_blank"
-rel="noopener"
->
-Happ Android
-<span>
-Google Play
-</span>
-</a>
-
-<a
-class="download"
-href="https://dl.v2rayng.org/releases/latest/v2rayNG_2.2.6_arm64-v8a.apk"
-target="_blank"
-rel="noopener"
->
-v2rayNG
-<span>
-Android APK
-</span>
-</a>
-
-<a
-class="download"
-href="https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box"
-target="_blank"
-rel="noopener"
->
-V2Box Android
-<span>
-Google Play
-</span>
-</a>
-
-<a
-class="download"
-href="https://apps.apple.com/app/happ-proxy-utility/id6504287215"
-target="_blank"
-rel="noopener"
->
-Happ
-<span>
-iPhone / iPad
-</span>
-</a>
-
-<a
-class="download"
-href="https://apps.apple.com/app/v2box-v2ray-client/id6446814690"
-target="_blank"
-rel="noopener"
->
-V2Box
-<span>
-iPhone / iPad
-</span>
-</a>
-
-<a
-class="download"
-href="https://apps.apple.com/app/streisand/id6450534064"
-target="_blank"
-rel="noopener"
->
-Streisand
-<span>
-iPhone / iPad
-</span>
-</a>
-
-<a
-class="download"
-href="https://apps.apple.com/app/foxray/id6448898396"
-target="_blank"
-rel="noopener"
->
-FoXray
-<span>
-iPhone / iPad
-</span>
-</a>
-
-<a
-class="download"
-href="https://github.com/2dust/v2rayN/releases/latest"
-target="_blank"
-rel="noopener"
->
-v2rayN
-<span>
-Windows
-</span>
-</a>
-
-<a
-class="download"
-href="https://happ-proxy.com/"
-target="_blank"
-rel="noopener"
->
-Happ
-<span>
-Windows
-</span>
-</a>
-
-</div>
-
-<div class="notice">
-
-<strong>
- مهـم | آپدیـت برنامـه اتصـال
-</strong>
-
-<br>
-
-دوستان عزیـز ❤️
-برای اینکـه کانفیگ‌هـای جدیـد بهتریـن
-سازگـــاری، پایداری و عملکرد رو داشته باشن،
-لطفـاً برنامـه‌ای کــــــــه بـرای اتصـال استفـاده می‌کنیـد
-رو بــه آخرین نسخـــه آپدیــت کنیــد. 🔄⚡️
-
-</div>
-
-</div>
-
-</div>
-
-
-<!-- ===================================================== -->
-<!-- MANUAL MODAL -->
-<!-- ===================================================== -->
-
-<div
-id="manualModal"
-class="modal-backdrop"
->
-
-<div class="modal">
-
-<div class="modal-head">
-
-<div class="modal-title">
-ساخـت کانفیـگ دستــی
-</div>
-
-<button class="close" onclick="closeManualModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
-  ×
-</button>
-
-</div>
-
-<div class="form-grid">
-
-<div class="field">
-
-<label>
-اسـم کانفیـگ
-</label>
-
-<input
-id="manualName"
-placeholder="اسم کانفیگ"
-/>
-
-</div>
-
-
-<div class="field" style="margin-bottom: 16px;">
-  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
-    <span>پروتکــل (بتا)</span>
-    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: XHTTP Packet Up</span>
-  </label>
-  <select id="manualProtocol" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-    <option value="vless-ws" style="background-color: #1f2937; color: #ffffff;">VLESS WebSocket</option>
-    <option value="xhttp-packet-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Packet Up (پیشنهادی)</option>
-    <option value="xhttp-stream-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream Up</option>
-    <option value="xhttp-stream-one" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream One</option>
-    <option value="vmess-ws" style="background-color: #1f2937; color: #ffffff;">VMess WebSocket</option>
-    <option value="trojan-ws" style="background-color: #1f2937; color: #ffffff;">Trojan WebSocket</option>
-    <option value="shadowsocks" style="background-color: #1f2937; color: #ffffff;">Shadowsocks</option>
-    <option value="socks5" style="background-color: #1f2937; color: #ffffff;">SOCKS5</option>
-    <option value="http" style="background-color: #1f2937; color: #ffffff;">HTTP Proxy</option>
-    <option value="hysteria2" style="background-color: #1f2937; color: #ffffff;">Hysteria 2</option>
-    <option value="tuic" style="background-color: #1f2937; color: #ffffff;">TUIC</option>
-    <option value="highspeed-demo" style="background-color: #1f2937; color: #60a5fa;">HighSpeed Upload/Download (دمو)</option>
-    <option value="gaming-lite-demo" style="background-color: #1f2937; color: #60a5fa;">Gaming Lite (دمو)</option>
-  </select>
-</div>
-
-<div class="field">
-<label>دسته‌بندی</label>
-<select id="manualCategory" style="width:100%;background:#1f2937;color:#fff;padding:10px;border:1px solid rgba(255,255,255,.15);border-radius:8px">
-<option value="0">0 — عمومی</option>
-<option value="1">1 — VIP</option>
-</select>
-</div>
-<div class="field">
-<label>تعداد کانفیگ در ساب (۱-۴۰)</label>
-<input id="manualConfigCount" type="number" min="1" max="40" value="1" />
-</div>
-<div class="field full">
-<label>IP تمیز (اختیاری)</label>
-<textarea id="manualCleanIps" style="min-height:60px;direction:ltr" placeholder="1.2.3.4"></textarea>
-</div>
-<div class="field">
-<label style="display:flex;align-items:center;gap:8px;cursor:pointer" onclick="toggleAlarmCheck()">
-<span id="alarmToggle" style="display:inline-flex;width:20px;height:20px;border-radius:5px;border:2px solid #6b7280;background:#374151;align-items:center;justify-content:center;color:transparent;font-size:12px">✓</span>
-<input type="checkbox" id="manualAlarm" style="display:none">
-آلارم انقضا/حجم
-</label>
-</div>
-
-<div class="field">
-
-<label>
-حجـم
-</label>
-
-<input
-id="manualVolume"
-type="number"
-min="0"
-placeholder="0 = نامحدود"
-/>
-
-</div>
-
-
-<div class="field" style="margin-bottom: 16px;">
-  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
-    <span>واحد حجـم</span>
-    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: GB</span>
-  </label>
-  <select id="manualVolumeUnit" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-    <option value="GB" style="background-color: #1f2937; color: #ffffff;">GB</option>
-    <option value="MB" style="background-color: #1f2937; color: #ffffff;">MB</option>
-    <option value="TB" style="background-color: #1f2937; color: #ffffff;">TB</option>
-  </select>
-</div>
-
-
-<div class="field">
-
-<label>
-تعـداد روز
-</label>
-
-<input
-id="manualDays"
-type="number"
-min="0"
-placeholder="0 = نامحدود"
-/>
-
-</div>
-
-
-<div class="field">
-
-<label>
-محدودیـت IP
-</label>
-
-<input
-id="manualIpLimit"
-type="number"
-min="0"
-placeholder="0 = نامحدود"
-/>
-
-</div>
-
-
-<div class="field">
-
-<label>
-محدودیـت اتصـال
-</label>
-
-<input
-id="manualConnections"
-type="number"
-min="0"
-placeholder="0 = نامحدود"
-/>
-
-</div>
-
-
-<div class="field">
-
-<label>
-محدودیـت سرعـت
-</label>
-
-<input
-id="manualSpeed"
-type="number"
-min="0"
-placeholder="0 = نامحدود"
-/>
-
-</div>
-
-
-<div class="field">
-
-<label>
-Fingerprint
-</label>
-
-<select id="manualFingerprint" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-  <option value="chrome" style="background-color: #1f2937; color: #ffffff;">Chrome</option>
-  <option value="firefox" style="background-color: #1f2937; color: #ffffff;">Firefox</option>
-  <option value="safari" style="background-color: #1f2937; color: #ffffff;">Safari</option>
-  <option value="ios" style="background-color: #1f2937; color: #ffffff;">iOS</option>
-  <option value="android" style="background-color: #1f2937; color: #ffffff;">Android</option>
-  <option value="edge" style="background-color: #1f2937; color: #ffffff;">Edge</option>
-  <option value="360" style="background-color: #1f2937; color: #ffffff;">360</option>
-  <option value="qq" style="background-color: #1f2937; color: #ffffff;">QQ</option>
-  <option value="random" style="background-color: #1f2937; color: #ffffff;">Random</option>
-  <option value="randomized" style="background-color: #1f2937; color: #ffffff;">Randomized</option>
-</select>
-
-</div>
-
-
-<div class="field">
-
-<label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
-  <span>Fragment</span>
-  <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: خاموش</span>
-</label>
-
-<select id="manualFragment" style="background-color: #1f2937; color: #ffffff; padding: 8px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-  <option value="off" style="background-color: #1f2937; color: #ffffff;">خاموش</option>
-  <option value="safe" style="background-color: #1f2937; color: #ffffff;">Safe</option>
-  <option value="balanced" style="background-color: #1f2937; color: #ffffff;">Balanced</option>
-  <option value="aggressive" style="background-color: #1f2937; color: #ffffff;">Aggressive</option>
-</select>
-
-</div>
-
-
-<div class="field">
-
-<label>
-Port
-</label>
-
-<input
-id="manualPort"
-type="number"
-min="1"
-max="65535"
-value="443"
-/>
-
-</div>
-
-
-<div class="field">
-
-<label>
-ALPN
-</label>
-
-<input
-id="manualAlpn"
-value="http/1.1"
-/>
-
-</div>
-
-
-<div class="field full">
-
-<label>
-یادداشــت
-</label>
-
-<textarea
-id="manualNote"
-placeholder="یادداشت اختیاری"
-></textarea>
-
-</div>
-
-</div>
-
-<div class="modal-actions">
-
-<button
-class="modal-btn secondary"
-onclick="closeManualModal()"
->
-انصراف
-</button>
-
-<button
-class="modal-btn primary"
-onclick="createManual()"
->
-ساخت کانفیگ
-</button>
-
-</div>
-
-</div>
-
-</div>
-
-<!-- ===================================================== -->
-
-<!-- AUTO MODAL -->
-
-<!-- ===================================================== -->
-
-
-
-<div
-
-id="autoModal"
-
-class="modal-backdrop"
-
->
-
-
-
-<div class="modal">
-
-
-
-<div class="modal-head">
-
-
-
-<div class="modal-title">
-
-ساخـت خودکــار
-
-</div>
-
-
-
-<button class="close" onclick="closeAutoModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
-  ×
-</button>
-
-
-
-</div>
-
-
-
-<div class="form-grid" style="margin-top:14px">
-<div class="field"><label>دسته‌بندی</label>
-<select id="autoCategory" style="width:100%;background:#1f2937;color:#fff;padding:10px;border:1px solid rgba(255,255,255,.15);border-radius:8px">
-<option value="0">0 — عمومی</option><option value="1">1 — VIP</option>
-</select></div>
-<div class="field"><label>تعداد کانفیگ (۱-۴۰)</label>
-<input id="autoConfigCount" type="number" min="1" max="40" value="1" /></div>
-<div class="field">
-
-<label>پروتکـل</label>
-
-<select id="autoProtocol" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-  <option value="vless-ws" style="background-color: #1f2937; color: #ffffff;">VLESS WebSocket</option>
-  <option value="xhttp-packet-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Packet Up</option>
-  <option value="xhttp-stream-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream Up</option>
-  <option value="xhttp-stream-one" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream One</option>
-  <option value="vmess-ws" style="background-color: #1f2937; color: #ffffff;">VMess WebSocket</option>
-  <option value="trojan-ws" style="background-color: #1f2937; color: #ffffff;">Trojan WebSocket</option>
-  <option value="shadowsocks" style="background-color: #1f2937; color: #ffffff;">Shadowsocks</option>
-  <option value="socks5" style="background-color: #1f2937; color: #ffffff;">SOCKS5</option>
-  <option value="http" style="background-color: #1f2937; color: #ffffff;">HTTP Proxy</option>
-  <option value="hysteria2" style="background-color: #1f2937; color: #ffffff;">Hysteria 2</option>
-  <option value="tuic" style="background-color: #1f2937; color: #ffffff;">TUIC</option>
-  <option value="highspeed-demo" style="background-color: #1f2937; color: #60a5fa;">HighSpeed Upload/Download (دمو)</option>
-  <option value="gaming-lite-demo" style="background-color: #1f2937; color: #60a5fa;">Gaming Lite (دمو)</option>
-  <option value="xhttp-packet-up" style="background-color: #1f2937; color: #60a5fa;">XHTTP Packet Up</option>
-  <option value="xhttp-stream-up" style="background-color: #1f2937; color: #60a5fa;">XHTTP Stream Up</option>
-</select>
-
-</div>
-
-<div class="field" style="margin-bottom: 16px;">
-
-  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
-
-    <span>پروفایـل امنیتـی</span>
-
-    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: Maximum</span>
-
-  </label>
-
-  <select id="autoProfile" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
-
-    <option value="balanced" style="background-color: #1f2937; color: #ffffff;">Balanced</option>
-
-    <option value="gaming" style="background-color: #1f2937; color: #ffffff;">Gaming</option>
-
-    <option value="maximum" style="background-color: #1f2937; color: #ffffff;">Maximum</option>
-
-    <option value="normal" style="background-color: #1f2937; color: #ffffff;">Normal</option>
-
-  </select>
-
-</div>
-
-</div>
-
-
-
-<div
-
-style="
-
-color:rgba(255,255,255,.55);
-
-font-size:11px;
-
-line-height:2;
-
-">
-
-
-
-اسم کانفیگ ها کاملا رندوم
-
-<code>pxpanel_********</code>
-
-ساخته می‌شود.
-
-
-
-<br>
-
-
-
-حجـم: <b>نامحدود</b>
-
-
-
-<br>
-
-
-
-زمـان: <b>نامحدود</b>
-
-
-
-<br>
-
-
-
-محدودیـت ایپـی: <b>نامحدود</b>
-
-
-
-<br>
-
-
-
-محدودیـت سرعـت: <b>نامحدود</b>
-
-
-
-<br>
-
-
-
-محدودیـت اتصال همزمـان: <b>نامحدود</b>
-
-
-
-<br>
-
-
-
-پروتکـل:
-
-<b>VLESS WebSocket</b>
-
-
-
-<br>
-
-
-
-پورت:
-
-<b>443</b>
-
-
-
-</div>
-
-
-
-<div class="modal-actions">
-
-
-
-<button
-
-class="modal-btn secondary"
-
-onclick="closeAutoModal()"
-
->
-
-لغو
-
-</button>
-
-
-
-<button
-
-class="modal-btn primary"
-
-onclick="createAuto()"
-
->
-
-ساخت
-
-</button>
-
-
-
-</div>
-
-
-
-</div>
-
-
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- PASSWORD MODAL -->
-<!-- ===================================================== -->
-
-<div
-id="passwordModal"
-class="modal-backdrop"
->
-
-<div class="modal">
-
-<div class="modal-head">
-
-<div class="modal-title">
-تغییر رمز پنـل
-</div>
-
-<button class="close" onclick="closePasswordModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
-  ×
-</button>
-
-</div>
-
-<div class="form-grid">
-
-<div class="field full">
-
-<label>
-رمز فعلـی
-</label>
-
-<input
-id="currentPassword"
-type="password"
-/>
-
-</div>
-
-<div class="field">
-
-<label>
-رمز جدیـد
-</label>
-
-<input
-id="newPassword"
-type="password"
-/>
-
-</div>
-
-<div class="field">
-
-<label>
-تکرار رمز جدیـد
-</label>
-
-<input
-id="repeatPassword"
-type="password"
-/>
-
-</div>
-
-</div>
-
-<div class="modal-actions">
-
-<button
-class="modal-btn secondary"
-onclick="closePasswordModal()"
->
-لغو
-</button>
-
-<button
-class="modal-btn primary"
-onclick="changePassword()"
->
-ذخیره رمـز عبور
-</button>
-
-</div>
-
-</div>
-
-</div>
-
-
-    <!-- LOGIN NOTICE START -->
-<div id="loginNoticeModal" class="login-notice-backdrop" role="dialog" aria-modal="true" aria-labelledby="regionNoticeTitle">
-  <div class="login-notice">
-    <div class="login-notice-head">
-      <div class="login-notice-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
-          <path d="M12 3a9 9 0 1 0 9 9"/>
-          <path d="M12 7v5l3 2"/>
-          <path d="M16.5 3.5h4v4"/>
-          <path d="m20.5 3.5-5 5"/>
-        </svg>
-      </div>
-      <div>
-        <h3 id="regionNoticeTitle">راهنمای اتصال سرویس</h3>
-        <p>اطلاعیه مهم منطقه‌ای پیش از اتصال کانفیگ‌ها</p>
-      </div>
+<div class="mob-bar">
+  <div style="font-weight:800;font-size:15px">PXPanel</div>
+  <button class="btn btn-sm" id="mobMenuBtn" aria-label="menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+  </button>
+</div>
+<div class="overlay" id="overlay"></div>
+
+<aside class="sidebar" id="sidebar">
+  <button class="sb-toggle" id="sbToggle" title="Toggle">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+  </button>
+  <div class="sb-logo">
+    <div class="sb-logo-icon">PX</div>
+    <div class="sb-logo-text">
+      <div class="sb-logo-name">PXPanel</div>
+      <div class="sb-logo-ver">v13.9.4</div>
     </div>
-    <div class="login-notice-body">
-      <p><b>نکته:</b> برای استفاده، لینک اشتراک (SUB) را در برنامه وارد (Import / Subscription) کرده یا از لینک مستقیم VLESS استفاده کنید.</p>
-      <div class="region-warning" role="alert">
-        <div class="warning-title">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-            <path d="m12 3 9 17H3L12 3Z"/>
-            <path d="M12 9v5"/>
-            <path d="M12 17h.01"/>
-          </svg>
-          هشدار منطقه‌ای اتصال
+  </div>
+  <nav class="nav">
+    <div class="nav-sec" data-i18n="sec_panel">پنــــل</div>
+    <button class="nav-item on" data-page="dash" data-perm="dash">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      <span class="nav-label" data-i18n="nav_dash">داشبـورد</span>
+    </button>
+    <button class="nav-item" data-page="configs" data-perm="configs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+      <span class="nav-label" data-i18n="nav_configs">کانفیگ‌هـا</span>
+    </button>
+    <button class="nav-item" data-page="groups" data-perm="configs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <span class="nav-label" data-i18n="nav_groups">گروه‌هـا</span>
+    </button>
+    <button class="nav-item" data-page="create" data-perm="create">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg>
+      <span class="nav-label" data-i18n="nav_create">ساخت کانفیـگ</span>
+    </button>
+    <button class="nav-item" data-page="stats" data-perm="stats">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 5-6"/></svg>
+      <span class="nav-label" data-i18n="nav_stats">امـار</span>
+    </button>
+    <button class="nav-item" data-page="logs" data-perm="logs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+      <span class="nav-label" data-i18n="nav_logs">لاگ فعالیـت</span>
+    </button>
+    <div class="nav-sec" data-i18n="sec_sys">سیستـم</div>
+    <button class="nav-item" data-page="telegram" data-perm="telegram">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 0C5.37 0 0 5.37 0 12s5.37 12 12 12 12-5.37 12-12S18.63 0 12 0zm5.56 8.2-1.86 8.77c-.14.62-.5.77-1.01.48l-2.8-2.06-1.35 1.3c-.15.15-.27.27-.55.27l.2-2.84 5.18-4.68c.22-.2-.05-.31-.35-.12l-6.4 4.03-2.76-.86c-.6-.19-.61-.6.12-.89l10.78-4.16c.5-.18.94.12.78.86z"/></svg>
+      <span class="nav-label" data-i18n="nav_telegram">پی ایکس بات</span>
+    </button>
+    <button class="nav-item" data-page="news" data-perm="news">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6Z"/></svg>
+      <span class="nav-label" data-i18n="nav_news">اخبـار</span>
+    </button>
+    <button class="nav-item" data-page="admins" data-perm="admins">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span class="nav-label" data-i18n="nav_admins">ادمین‌هـا</span>
+    </button>
+    <button class="nav-item" data-page="settings" data-perm="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      <span class="nav-label" data-i18n="nav_settings">تنظیمـات</span>
+    </button>
+    <button class="nav-item" data-page="support" data-perm="support">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>
+      <span class="nav-label" data-i18n="nav_support">پشتیبانـی</span>
+    </button>
+    <button class="nav-item" data-page="donate">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+      <span class="nav-label" data-i18n="nav_donate">حمایت مالـی</span>
+    </button>
+  </nav>
+  <div class="sb-foot">
+    <button type="button" id="themeBtn" onclick="toggleTheme()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <span id="themeLabel" data-i18n="theme">تم روشـن</span>
+    </button>
+    <button type="button" onclick="refreshAll()" title="Stats">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.1-3.4L23 10M1 14l5.4 4.4A9 9 0 0 0 20.5 15"/></svg>
+      <span data-i18n="refresh_stats">بروزرسانی امـار</span>
+    </button>
+    <button type="button" onclick="panelUpdate()" title="Panel" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.35);color:#34d399">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+      <span data-i18n="refresh_panel">بروزرسانی پنـل</span>
+    </button>
+    <a href="/logout" class="btn danger">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M10 5H5v14h5"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg>
+      <span data-i18n="logout">خروج</span>
+    </a>
+  </div>
+</aside>
+
+<main class="main" id="main">
+
+<section class="page on" id="page-dash">
+  <div class="page-head">
+    <div>
+      <div class="page-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span data-i18n="nav_dash">داشبورد</span>
+      </div>
+      <div class="page-sub" id="lastUpd" data-i18n="loading">در حال بارگـذاری...</div>
+    </div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="metric-label" data-i18n="m_conns">اتصالات فعـال</div><div class="metric-val" id="mConns">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_traffic">ترافیک کـل</div><div class="metric-val" id="mTraffic">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_links">کانفیگ‌هـا</div><div class="metric-val" id="mLinks">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_uptime">آپتایـم سرور</div><div class="metric-val" id="mUptime" style="font-size:17px">—</div></div>
+  </div>
+  <div class="g2">
+    <div class="card action-card" onclick="goPage('create')">
+      <div class="card-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg><span data-i18n="quick_create">ساخت کانفیگ</span></div>
+      <p style="color:var(--t2);font-size:12px;line-height:1.6" data-i18n="quick_create_desc">ساخت دستی با محدودیت ترافیک، سرعت، تعداد و انقضا</p>
+    </div>
+    <div class="card action-card purple" onclick="doAutoCreate()">
+      <div class="card-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg><span data-i18n="auto_create">ساخت خودکار (پیشنهادی)</span></div>
+      <p style="color:var(--t2);font-size:12px;line-height:1.6" data-i18n="auto_create_desc">ساخت سریع با تنظیمات بهینه · لینک VLESS و ساب</p>
+    </div>
+  </div>
+</section>
+
+<section class="page" id="page-configs">
+  <div class="page-head">
+    <div>
+      <div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg><span data-i18n="nav_configs">کانفیگ‌ها</span></div>
+      <div class="page-sub" data-i18n="configs_sub">مدیریـت لینک‌هــا · VLESS و سـاب</div>
+    </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input id="cfgSearch" placeholder="جستجو..." oninput="filterConfigs()" style="padding:8px 12px;border-radius:10px;border:1px solid var(--card-b);background:var(--input-bg);color:var(--t1);font-family:inherit;font-size:12px;min-width:140px">
+
+      <button class="btn btn-p btn-sm" onclick="goPage('create')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M12 5v14M5 12h14"/></svg></button>
+      <button class="btn btn-sm" onclick="refreshAll()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.1-3.4L23 10"/></svg></button>
+    </div>
+  </div>
+  <div class="card" style="padding:0">
+    <div class="table-wrap">
+      <div id="bulkBar" style="display:none"></div>
+      <table>
+        <thead><tr>
+          <th style="width:40px;text-align:center;padding:10px 8px">
+            <input type="checkbox" id="chkAll" onchange="toggleSelectAll(this.checked);updateBulkBar()" title="انتخاب همه" style="width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer">
+          </th>
+          <th style="width:28px;padding:10px 4px"></th>
+          <th data-i18n="th_name">نـام</th><th data-i18n="th_proto">پروتکـل</th><th data-i18n="th_status">وضعیت</th>
+          <th data-i18n="th_usage">مصـرف</th><th data-i18n="th_ops">عملیـات</th>
+        </tr></thead>
+        <tbody id="linksTable"><tr><td colspan="7" style="text-align:center;color:var(--t3);padding:32px">...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="page" id="page-create">
+  <div class="page-head">
+    <div><div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg><span data-i18n="nav_create">ساخت کانفیگ</span></div></div>
+  </div>
+  <div class="g2">
+    <div class="card">
+      <div class="card-title" data-i18n="manual_create">ساخت دستی</div>
+      <div class="field"><label data-i18n="label_name">نام</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="cName" placeholder="auto" style="flex:1">
+          <button type="button" class="btn btn-sm" onclick="randomName()" title="Random" style="min-width:44px;height:42px">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+          </button>
         </div>
-        <p>در صورتی که پنل با موفقیت نصب شد اما کانفیگ‌ها پینگ نداشتند، دامنه مسدود شده است؛ لطفاً دامنه جدیدی بسازید.</p>
       </div>
+            <div class="field"><label data-i18n="label_proto">پروتکـل</label><select id="cProto"></select></div>
+      <div class="field"><label>گروه</label><select id="cGroup"></select></div>
+<div class="form-row">
+        <div class="field"><label data-i18n="label_count">تعداد کانفیگ در ساب (۱–۴۰)</label><input id="cCount" type="number" value="1" min="1" max="40"></div>
+        <div class="field"><label data-i18n="label_days">انقضـا (روز)</label><input id="cDays" type="number" value="0" min="0"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label data-i18n="label_limit">محدودیت حجم</label><input id="cLimit" type="number" value="0" min="0"></div>
+        <div class="field"><label data-i18n="label_unit">واحد</label><select id="cUnit"><option>GB</option><option>MB</option><option>KB</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label data-i18n="label_ip">محدودیت IP</label><input id="cIp" type="number" value="0" min="0"></div>
+        <div class="field"><label data-i18n="label_speed">سرعـت (Mbps)</label><input id="cSpeed" type="number" value="0" min="0"></div>
+      </div>
+      <button class="btn btn-p" style="width:100%" onclick="doManualCreate()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M12 5v14M5 12h14"/></svg>
+        <span data-i18n="btn_create">ساخت</span>
+      </button>
     </div>
-    <div class="notice-downloads">
-      <a class="notice-download" href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer">
-        <strong>v2rayNG</strong>
-        <span>اندروید</span>
-      </a>
-      <a class="notice-download" href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer">
-        <strong>v2rayN</strong>
-        <span>ویندوز / مک / لینوکس</span>
-      </a>
-      <a class="notice-download" href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer">
-        <strong>Hiddify</strong>
-        <span>چندپلتفرمی</span>
-      </a>
-    </div>
-    <div class="login-notice-actions">
-      <button type="button" onclick="closeLoginNotice()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-          <path d="m5 12 4 4L19 6"/>
-        </svg>
-        متوجه شدم
+    <div class="card" style="border-color:rgba(139,92,246,.35)">
+      <div class="card-title" data-i18n="auto_create">ساخت خودکـار (پیشنهــادی)</div>
+      <p style="color:var(--t2);font-size:13px;line-height:1.75;margin-bottom:14px" data-i18n="auto_desc">با یک کلیک کانفیگ بهینه ساخته می‌شود. بعد از ساخت لینک VLESS و ساب در اختیار شماست.</p>
+      <div class="field"><label data-i18n="label_proto">پروتکـل</label><select id="aProto"></select></div>
+      <div class="field"><label data-i18n="label_count">تعداد کانفیگ در سـاب (1-40)</label><input id="aCount" type="number" value="1" min="1" max="40"></div>
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="doAutoCreate()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2"/></svg>
+        <span data-i18n="btn_auto">ساخـت خودکــار</span>
       </button>
     </div>
   </div>
-</div>
-<!-- LOGIN NOTICE END -->
+</section>
 
-<div id="mixModal" class="modal-backdrop">
-<div class="modal" style="max-width:640px">
-<div class="modal-head"><div class="modal-title">مخلوط‌سازی کانفیگ‌ها</div>
-<button class="close" onclick="closeMixModal()">×</button></div>
-<p style="color:rgba(255,255,255,.55);font-size:11px;line-height:1.9;margin:0 0 12px">
-چند کانفیگ از لیست «مدیریت کانفیگ‌ها» را انتخاب کنید تا داخل یک ساب واحد ترکیب شوند.
-حداقل ۲ و حداکثر ۴۰ کانفیگ. بعد از ساخت، لینک ساب مخلوط در اختیار شماست.
-</p>
-<div id="mixList" style="max-height:280px;overflow:auto;margin-bottom:12px"></div>
-<div class="modal-actions">
-<button class="modal-btn secondary" onclick="closeMixModal()">بستن</button>
-<button class="modal-btn primary" style="background:linear-gradient(135deg,#dc2626,#ef4444)" onclick="doMixConfigs()">ساخت ساب مخلوط</button>
-</div></div></div>
 
-<div id="categoryModal" class="modal-backdrop">
-<div class="modal" style="max-width:620px">
-<div class="modal-head"><div class="modal-title">دسته‌بندی‌ها</div>
-<button class="close" onclick="closeCategoryModal()">×</button></div>
-<div id="categoryList" style="font-size:11px;margin-bottom:12px"></div>
-<div class="form-grid">
-<div class="field full"><label>نام</label><input id="catName" placeholder="نام دسته‌بندی" /></div>
-<div class="field"><label>حجم</label><input id="catVolume" type="number" min="0" placeholder="0 = نامحدود" /></div>
-<div class="field"><label>واحد</label><select id="catVolumeUnit"><option value="GB">GB</option><option value="MB">MB</option><option value="TB">TB</option></select></div>
-<div class="field"><label>روز</label><input id="catDays" type="number" min="0" placeholder="0 = نامحدود" /></div>
-<div class="field"><label>IP Limit</label><input id="catIp" type="number" min="0" placeholder="0 = نامحدود" /></div>
-<div class="field"><label>اتصال</label><input id="catConn" type="number" min="0" placeholder="0 = نامحدود" /></div>
-<div class="field"><label>سرعت Mbit</label><input id="catSpeed" type="number" min="0" placeholder="0 = نامحدود" /></div>
-<div class="field full"><label>IP تمیز</label><textarea id="catClean" style="min-height:48px;direction:ltr" placeholder="اختیاری"></textarea></div>
-<div class="field"><label><input type="checkbox" id="catRandom"> اسم تصادفی</label></div>
-<div class="field"><label><input type="checkbox" id="catSingle"> تک‌کاربره</label></div>
-<input type="hidden" id="catEditId" value="" />
-</div>
-<div class="modal-actions">
-<button class="modal-btn secondary" onclick="closeCategoryModal()">بستن</button>
-<button class="modal-btn primary" onclick="createCategory()">ساخت</button>
-</div></div></div>
-
-<div id="toast" class="toast"></div>
-
-
-<script>
-
-let editingLink = null;
-
-
-/* LOGIN NOTICE START — DELETE THIS WHOLE BLOCK TO DISABLE THE LOGIN NOTICE */
-function closeLoginNotice(){const modal=document.getElementById("loginNoticeModal");if(modal)modal.remove();try{history.replaceState({},document.title,location.pathname)}catch(e){}}
-(function(){
-    const modal=document.getElementById("loginNoticeModal");
-    if(modal && new URLSearchParams(location.search).get("login") !== "1") modal.remove();
-})();
-window.addEventListener("keydown",event=>{if(event.key==="Escape")closeLoginNotice()});
-/* LOGIN NOTICE END */
-
-function escapeHtml(value){
-
-    return String(
-        value ?? ""
-    )
-
-    .replaceAll(
-        "&",
-        "&amp;"
-    )
-
-    .replaceAll(
-        "<",
-        "&lt;"
-    )
-
-    .replaceAll(
-        ">",
-        "&gt;"
-    )
-
-    .replaceAll(
-        '"',
-        "&quot;"
-    )
-
-    .replaceAll(
-        "'",
-        "&#039;"
-    );
-
-}
-
-
-function formatBytes(value){
-
-    value =
-        Number(
-            value || 0
-        );
-
-    if(
-        value < 1024
-    ){
-        return (
-            value +
-            " B"
-        );
-    }
-
-    if(
-        value < 1024 ** 2
-    ){
-        return (
-            (
-                value /
-                1024
-            ).toFixed(1)
-            +
-            " KB"
-        );
-    }
-
-    if(
-        value < 1024 ** 3
-    ){
-        return (
-            (
-                value /
-                1024 ** 2
-            ).toFixed(2)
-            +
-            " MB"
-        );
-    }
-
-    return (
-        (
-            value /
-            1024 ** 3
-        ).toFixed(2)
-        +
-        " GB"
-    );
-
-}
-
-
-function showToast(message){
-
-    const toast =
-        document.getElementById(
-            "toast"
-        );
-
-    toast.textContent =
-        message;
-
-    toast.classList.add(
-        "show"
-    );
-
-    clearTimeout(
-        window.__toastTimer
-    );
-
-    window.__toastTimer =
-        setTimeout(
-            () => {
-                toast.classList.remove(
-                    "show"
-                );
-            },
-            2200
-        );
-
-}
-
-
-async function api(
-    url,
-    options = {}
-){
-
-    try{
-
-        const response =
-            await fetch(
-                url,
-                {
-                    cache:"no-store",
-                    credentials:"same-origin",
-                    ...options
-                }
-            );
-
-        if(
-            response.status === 401
-        ){
-
-            location.href =
-                "/login";
-
-            return null;
-
-        }
-
-        let data = null;
-
-        try{
-
-            data =
-                await response.json();
-
-        }catch{
-
-            data = {
-                ok:false,
-                error:
-                    "پاسخ سرور قابل خواندن نیست"
-            };
-
-        }
-
-        if(
-            !response.ok
-        ){
-
-            const message =
-                data.detail ||
-                data.error ||
-                "خطای سرور";
-
-            showToast(
-                message
-            );
-
-            console.error(
-                "API error:",
-                url,
-                data
-            );
-
-            return null;
-        }
-
-        return data;
-
-    }catch(error){
-
-        console.error(
-            "Request failed:",
-            url,
-            error
-        );
-
-        showToast(
-            "ارتباط با سرور برقرار نشد"
-        );
-
-        return null;
-
-    }
-
-}
-
-
-async function refresh(){
-
-    const results =
-        await Promise.all([
-            api("/stats"),
-            api("/api/links"),
-            api("/api/activity"),
-            api("/api/categories")
-        ]);
-    if(results[3]&&results[3].categories){
-      var opts=results[3].categories.map(function(cat){return "<option value='"+cat.id+"'>"+cat.number+" — "+escapeHtml(cat.name)+"</option>";}).join("");
-      ["manualCategory","autoCategory"].forEach(function(id){var s=document.getElementById(id);if(s){var v=s.value;s.innerHTML=opts;if(v)s.value=v;}});
-    }
-
-    const statsData =
-        results[0];
-
-    const linksData =
-        results[1];
-
-    const activity =
-        results[2];
-
-    if(statsData){
-
-        document.getElementById(
-            "totalLinks"
-        ).textContent =
-            statsData.links_count;
-
-        document.getElementById(
-            "activeLinks"
-        ).textContent =
-            statsData.active_links;
-
-        document.getElementById(
-            "connections"
-        ).textContent =
-            statsData.active_connections;
-
-        document.getElementById(
-            "traffic"
-        ).textContent =
-            formatBytes(
-                statsData.total_traffic_bytes
-            );
-
-        document.getElementById(
-            "requests"
-        ).textContent =
-            statsData.total_requests;
-
-        document.getElementById(
-            "uptime"
-        ).textContent =
-            statsData.uptime;
-    }
-
-
-    if(linksData){
-
-        const table =
-            document.getElementById(
-                "linksTable"
-            );
-
-        table.innerHTML = "";
-
-
-        if(
-            !linksData.links ||
-            !linksData.links.length
-        ){
-
-            table.innerHTML = `
-                <tr>
-                    <td
-                    colspan="9"
-                    class="empty"
-                    >
-                    هنوز کانفیگی ساخته نشده است.
-                    </td>
-                </tr>
-            `;
-
-        }else{
-
-            for(
-                const link
-                of linksData.links
-            ){
-
-                const row =
-                    document.createElement(
-                        "tr"
-                    );
-
-                const limit =
-                    Number(
-                        link.limit_bytes ||
-                        0
-                    );
-
-                const used =
-                    Number(
-                        link.used_bytes ||
-                        0
-                    );
-
-                let usageText =
-                    formatBytes(
-                        used
-                    );
-
-                if(limit > 0){
-
-                    usageText +=
-                        " / " +
-                        formatBytes(
-                            limit
-                        );
-
-                }else{
-
-                    usageText +=
-                        " / ∞";
-                }
-
-
-                row.innerHTML = `
-
-<td style="text-align:center;font-weight:800;color:#60a5fa">${link.category_number != null ? link.category_number : 0}</td>
-<td>
-
-<div style="font-weight:700">
-${escapeHtml(
-    link.label
-)}
-</div>
-
-<div
-style="
-margin-top:3px;
-color:rgba(255,255,255,.25);
-font-size:8px;
-"
->
-${escapeHtml(
-    link.uuid
-)}
-</div>
-
-</td>
-
-
-<td>
-${escapeHtml(
-    link.protocol
-)}
-</td>
-
-
-<td>
-<span style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:5px;background:${link.status_color==='green'?'#22c55e':(link.status_color==='red'?'#ef4444':'#6b7280')}"></span>
-<span class="badge ${link.active ? 'active' : 'off'}">${link.active ? 'فعال' : 'غیرفعال'}</span>
-</td>
-
-
-<td>
-${usageText}
-</td>
-
-
-<td>
-${
-    link.expires_at
-    ? escapeHtml(
-        link.expires_at
-      )
-    : "∞"
-}
-</td>
-
-
-<td>
-${link.connected_ips || 0}
-</td>
-
-
-<td>
-
-<div
-class="url-box"
-title="${escapeHtml(link.vless)}"
->
-${escapeHtml(link.vless)}
-</div>
-
-</td>
-
-
-<td>
-
-<div class="actions">
-
-${link.show_vless !== false && link.vless ? '<button class="action primary" type="button" data-action="copy-vless">VLESS</button>' : ''}
-
-<button
-class="action"
-type="button"
-data-action="copy-sub"
->
-SUB
-</button>
-
-<button
-class="action"
-type="button"
-data-action="open-info"
->
-INFO
-</button>
-
-<button
-class="action"
-type="button"
-data-action="toggle"
->
-${
-    link.active
-    ? "خاموش"
-    : "فعال"
-}
-</button>
-
-<button
-class="action"
-type="button"
-data-action="reset"
->
-ریست
-</button>
-
-<button
-class="action danger"
-type="button"
-data-action="delete"
->
-حذف
-</button>
-
-</div>
-
-</td>
-
-`;
-
-                const actionButtons =
-                    row.querySelectorAll(
-                        "button[data-action]"
-                    );
-
-                actionButtons.forEach(
-                    (button) => {
-                        button.addEventListener(
-                            "click",
-                            async () => {
-                                const action =
-                                    button.dataset.action;
-
-                                if (action === "copy-vless") {
-                                    await copyText(link.vless);
-                                    return;
-                                }
-
-                                if (action === "copy-sub") {
-                                    await copyText(link.sub);
-                                    return;
-                                }
-
-                                if (action === "open-info") {
-                                    if (!link.info) {
-                                        showToast("لینک INFO موجود نیست");
-                                        return;
-                                    }
-                                    window.open(
-                                        String(link.info),
-                                        "_blank",
-                                        "noopener,noreferrer"
-                                    );
-                                    return;
-                                }
-
-                                button.disabled = true;
-                                try {
-                                    if (action === "toggle") {
-                                        await toggleLink(
-                                            link.uuid,
-                                            !Boolean(link.active)
-                                        );
-                                    } else if (action === "reset") {
-                                        await resetUsage(link.uuid);
-                                    } else if (action === "delete") {
-                                        await deleteLink(link.uuid);
-                                    }
-                                } finally {
-                                    button.disabled = false;
-                                }
-                            }
-                        );
-                    }
-                );
-
-                table.appendChild(
-                    row
-                );
-
-            }
-
-        }
-    }
-
-
-    if(activity && activity.logs){
-        var box = document.getElementById("logs");
-        if(box){
-            var items = activity.logs.slice().reverse();
-            if(!items.length){
-                box.innerHTML = "<div style='text-align:center;color:rgba(255,255,255,.3);padding:24px;font-size:11px'>فعالیتی ثبت نشده است</div>";
-            } else {
-                var html = "";
-                items.forEach(function(item){
-                    var level = (item.level || "info").toLowerCase();
-                    var color = "#60a5fa";
-                    var bg = "rgba(37,99,235,.08)";
-                    var border = "rgba(96,165,250,.18)";
-                    var icon = "ℹ";
-                    if(level === "ok" || level === "success"){
-                        color = "#4ade80"; bg = "rgba(34,197,94,.08)"; border = "rgba(74,222,128,.2)"; icon = "✓";
-                    } else if(level === "err" || level === "error"){
-                        color = "#f87171"; bg = "rgba(239,68,68,.08)"; border = "rgba(248,113,113,.2)"; icon = "!";
-                    } else if(level === "warn" || level === "warning"){
-                        color = "#fbbf24"; bg = "rgba(245,158,11,.08)"; border = "rgba(251,191,36,.2)"; icon = "⚠";
-                    }
-                    var t = item.time || "";
-                    try {
-                        if(t){
-                            var d = new Date(t);
-                            if(!isNaN(d.getTime())){
-                                t = d.toLocaleString("fa-IR", {hour:"2-digit", minute:"2-digit", second:"2-digit", day:"2-digit", month:"2-digit"});
-                            }
-                        }
-                    } catch(e){}
-                    var kind = item.kind ? ("<span style='opacity:.55;margin-left:6px'>· " + escapeHtml(item.kind) + "</span>") : "";
-                    html += "<div style='display:flex;gap:10px;align-items:flex-start;padding:10px 12px;margin-bottom:6px;border-radius:12px;background:" + bg + ";border:1px solid " + border + "'>";
-                    html += "<div style='flex:0 0 28px;width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;color:" + color + ";background:rgba(0,0,0,.2);border:1px solid " + border + "'>" + icon + "</div>";
-                    html += "<div style='flex:1;min-width:0'>";
-                    html += "<div style='font-size:11px;font-weight:600;color:rgba(255,255,255,.88);line-height:1.7'>" + escapeHtml(item.message || "") + "</div>";
-                    html += "<div style='margin-top:3px;font-size:9px;color:rgba(255,255,255,.35);display:flex;gap:8px;flex-wrap:wrap'>";
-                    html += "<span style='color:" + color + ";font-weight:700'>" + escapeHtml(level.toUpperCase()) + "</span>" + kind;
-                    if(t) html += "<span style='margin-right:auto;direction:ltr'>" + escapeHtml(t) + "</span>";
-                    html += "</div></div></div>";
-                });
-                box.innerHTML = html;
-            }
-        }
-    }
-
-}
-
-
-async function copyText(text){
-
-    const value =
-        String(text ?? "").trim();
-
-    if (!value) {
-        showToast("متنی برای کپی وجود ندارد");
-        return false;
-    }
-
-    try {
-        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-            await navigator.clipboard.writeText(value);
-            showToast("کپی شد");
-            return true;
-        }
-    } catch (error) {
-        console.warn("Clipboard API failed:", error);
-    }
-
-    try {
-        const textarea = document.createElement("textarea");
-        textarea.value = value;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        textarea.style.top = "0";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        textarea.setSelectionRange(0, textarea.value.length);
-        const copied = document.execCommand("copy");
-        textarea.remove();
-
-        if (copied) {
-            showToast("کپی شد");
-            return true;
-        }
-    } catch (error) {
-        console.warn("Legacy clipboard fallback failed:", error);
-    }
-
-    try {
-        window.prompt("لینک را کپی کنید:", value);
-    } catch (error) {
-        console.warn("Prompt fallback failed:", error);
-    }
-
-    return false;
-
-}
-
-function openManualModal(){
-
-    document
-        .getElementById(
-            "manualModal"
-        )
-        .classList.add(
-            "open"
-        );
-
-}
-
-
-function closeManualModal(){
-
-    document
-        .getElementById(
-            "manualModal"
-        )
-        .classList.remove(
-            "open"
-        );
-
-}
-
-
-function openAutoModal(){
-
-    document
-        .getElementById(
-            "autoModal"
-        )
-        .classList.add(
-            "open"
-        );
-
-}
-
-
-function closeAutoModal(){
-
-    document
-        .getElementById(
-            "autoModal"
-        )
-        .classList.remove(
-            "open"
-        );
-
-}
-
-
-function openPasswordModal(){
-
-    document
-        .getElementById(
-            "passwordModal"
-        )
-        .classList.add(
-            "open"
-        );
-
-}
-
-
-function closePasswordModal(){
-
-    document
-        .getElementById(
-            "passwordModal"
-        )
-        .classList.remove(
-            "open"
-        );
-
-}
-
-
-async function createAuto(){
-    const protocol = document.getElementById("autoProtocol")?.value || "vless-ws";
-    const profile = document.getElementById("autoProfile")?.value || "balanced";
-    const category_id = (document.getElementById("autoCategory")||{}).value || "0";
-    const config_count = Number((document.getElementById("autoConfigCount")||{}).value || 1);
-    closeAutoModal();
-    showToast("در حال ساخت کانفیگ حرفه‌ای...");
-    const result = await api("/api/links", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({protocol, profile, category_id, config_count, label:"", limit_value:0, expires_days:0})
-    });
-    if(!result || !result.ok) return;
-    const config = result.config || result.vless || result.link || "";
-    await copyText(config);
-    showToast("کانفیگ ساخته شد و در کلیپ‌بورد قرار گرفت");
-    await refresh();
-}
-
-
-async function createManual(){
-
-    const body = {
-
-        label:
-            document
-                .getElementById(
-                    "manualName"
-                )
-                .value
-                .trim()
-            ||
-            "کانفیگ جدید",
-
-        limit_value:
-            Number(
-                document
-                    .getElementById(
-                        "manualVolume"
-                    )
-                    .value
-                || 0
-            ),
-
-        limit_unit:
-            document
-                .getElementById(
-                    "manualVolumeUnit"
-                )
-                .value,
-
-        expires_days:
-            Number(
-                document
-                    .getElementById(
-                        "manualDays"
-                    )
-                    .value
-                || 0
-            ),
-
-        ip_limit:
-            Number(
-                document
-                    .getElementById(
-                        "manualIpLimit"
-                    )
-                    .value
-                || 0
-            ),
-
-        connection_limit:
-            Number(
-                document
-                    .getElementById(
-                        "manualConnections"
-                    )
-                    .value
-                || 0
-            ),
-
-        speed_limit_value:
-            Number(
-                document
-                    .getElementById(
-                        "manualSpeed"
-                    )
-                    .value
-                || 0
-            ),
-
-        speed_limit_unit:
-            "MBIT",
-
-        protocol:
-            document
-                .getElementById(
-                    "manualProtocol"
-                )
-                .value,
-
-        fingerprint:
-            document
-                .getElementById(
-                    "manualFingerprint"
-                )
-                .value,
-
-        fragment:
-            document
-                .getElementById(
-                    "manualFragment"
-                )
-                .value,
-
-        port:
-            Number(
-                document
-                    .getElementById(
-                        "manualPort"
-                    )
-                    .value
-                || 443
-            ),
-
-        alpn:
-            document
-                .getElementById(
-                    "manualAlpn"
-                )
-                .value,
-
-        note:
-            document
-                .getElementById(
-                    "manualNote"
-                )
-                .value,
-        clean_ips: (document.getElementById("manualCleanIps")||{}).value || "",
-        alarm_enabled: !!(document.getElementById("manualAlarm")||{}).checked,
-        category_id: (document.getElementById("manualCategory")||{}).value || "0",
-        config_count: Number((document.getElementById("manualConfigCount")||{}).value || 1)
-
-    };
-
-
-    const result =
-        await api(
-            "/api/links",
-            {
-                method:"POST",
-
-                headers:{
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify(
-                        body
-                    )
-            }
-        );
-
-
-    if(
-        !result
-    ){
-        return;
-    }
-
-
-    closeManualModal();
-
-    if(result.vless){
-
-        await copyText(
-            result.vless
-        );
-
-        showToast(
-            "کانفیگ ساخته شد"
-        );
-
-    }
-
-    await refresh();
-
-}
-
-
-async function toggleLink(
-    uuid,
-    active
-){
-
-    const result =
-        await api(
-            "/api/links/" +
-            encodeURIComponent(uuid),
-            {
-                method:"PATCH",
-                headers:{
-                    "Content-Type":"application/json"
-                },
-                body:JSON.stringify({
-                    active:Boolean(active)
-                })
-            }
-        );
-
-    if (!result || result.ok !== true) {
-        return false;
-    }
-
-    showToast(
-        active
-        ? "کانفیگ فعال شد"
-        : "کانفیگ غیرفعال شد"
-    );
-
-    await refresh();
-    return true;
-
-}
-
-
-async function resetUsage(
-    uuid
-){
-
-    const result =
-        await api(
-            "/api/links/" +
-            encodeURIComponent(uuid) +
-            "/reset-usage",
-            {
-                method:"POST"
-            }
-        );
-
-    if (!result || result.ok !== true) {
-        return false;
-    }
-
-    showToast("مصرف ریست شد");
-    await refresh();
-    return true;
-
-}
-
-
-async function deleteLink(
-    uuid
-){
-
-    if (!confirm("این کانفیگ حذف شود؟")) {
-        return false;
-    }
-
-    const result =
-        await api(
-            "/api/links/" +
-            encodeURIComponent(uuid),
-            {
-                method:"DELETE"
-            }
-        );
-
-    if (!result || result.ok !== true) {
-        return false;
-    }
-
-    showToast("کانفیگ حذف شد");
-    await refresh();
-    return true;
-
-}
-
-
-async function changePassword(){
-
-    const current =
-        document
-            .getElementById(
-                "currentPassword"
-            )
-            .value;
-
-    const newPassword =
-        document
-            .getElementById(
-                "newPassword"
-            )
-            .value;
-
-    const repeat =
-        document
-            .getElementById(
-                "repeatPassword"
-            )
-            .value;
-
-
-    const result =
-        await api(
-            "/api/change-password",
-            {
-                method:"POST",
-
-                headers:{
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify({
-
-                        current_password:
-                            current,
-
-                        new_password:
-                            newPassword,
-
-                        repeat_password:
-                            repeat
-
-                    })
-            }
-        );
-
-
-    if(
-        result
-        &&
-        result.ok
-    ){
-
-        closePasswordModal();
-
-        document
-            .getElementById(
-                "currentPassword"
-            )
-            .value = "";
-
-        document
-            .getElementById(
-                "newPassword"
-            )
-            .value = "";
-
-        document
-            .getElementById(
-                "repeatPassword"
-            )
-            .value = "";
-
-        showToast(
-            "رمز عبور تغییر کرد"
-        );
-
-    }
-
-}
-
-
-function openMixModal(){
-  var list=document.getElementById("mixList");
-  if(!list)return;
-  api("/api/links").then(function(data){
-    if(!data||!data.links){list.innerHTML="<div class='empty'>کانفیگی نیست</div>";return;}
-    var html="";
-    data.links.forEach(function(link){
-      if(!link.active)return;
-      html+="<label style='display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.03);margin-bottom:5px;cursor:pointer'>";
-      html+="<input type='checkbox' class='mix-check' value='"+link.uuid+"' style='width:16px;height:16px'>";
-      html+="<span style='flex:1'><b>"+escapeHtml(link.label)+"</b> <span style='color:rgba(255,255,255,.35);font-size:9px'>"+escapeHtml(link.protocol||"")+"</span></span>";
-      html+="<span style='color:#60a5fa;font-size:10px'>دسته "+(link.category_number!=null?link.category_number:0)+"</span>";
-      html+="</label>";
-    });
-    list.innerHTML=html||"<div class='empty'>کانفیگ فعالی نیست</div>";
-  });
-  document.getElementById("mixModal").classList.add("open");
-}
-function closeMixModal(){document.getElementById("mixModal").classList.remove("open");}
-async function doMixConfigs(){
-  var ids=[];
-  document.querySelectorAll(".mix-check:checked").forEach(function(el){ids.push(el.value);});
-  if(ids.length<2){showToast("حداقل ۲ کانفیگ انتخاب کنید");return;}
-  var res=await api("/api/mix-sub",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({link_ids:ids})});
-  if(res&&res.ok){
-    showToast("ساب مخلوط ساخته شد ("+res.count+")");
-    if(res.sub_url){await copyText(res.sub_url);showToast("لینک ساب کپی شد");}
-    closeMixModal();
-  }
-}
-
-function toggleAlarmCheck(){
-  var cb=document.getElementById("manualAlarm");
-  var box=document.getElementById("alarmToggle");
-  if(!cb||!box)return;
-  cb.checked=!cb.checked;
-  if(cb.checked){box.style.background="#22c55e";box.style.borderColor="#22c55e";box.style.color="#fff";}
-  else{box.style.background="#374151";box.style.borderColor="#6b7280";box.style.color="transparent";}
-}
-function openCategoryModal(){loadCategoriesUI();document.getElementById("categoryModal").classList.add("open");}
-function closeCategoryModal(){document.getElementById("categoryModal").classList.remove("open");}
-async function loadCategoriesUI(){
-  var data=await api("/api/categories");
-  if(!data||!data.categories)return;
-  window.__cats = data.categories;
-  var list=document.getElementById("categoryList");
-  var html=""; var opts="";
-  data.categories.forEach(function(cat){
-    opts+="<option value='"+cat.id+"'>"+cat.number+" — "+escapeHtml(cat.name)+"</option>";
-    html+="<div style='display:flex;justify-content:space-between;align-items:center;padding:8px;border-radius:10px;background:rgba(255,255,255,.03);margin-bottom:5px;gap:8px'><span><b style='color:#60a5fa'>"+cat.number+"</b> — "+escapeHtml(cat.name);
-    if(cat.single_user) html+=" <span style='color:#fbbf24;font-size:9px'>تک‌کاربره</span>";
-    html+="</span><span style='display:flex;gap:4px'>";
-    html+="<button class='action' type='button' onclick=\"editCategory('"+cat.id+"')\">ویرایش</button>";
-    if(cat.id!=="0"&&cat.id!=="1") html+="<button class='action danger' type='button' onclick=\"deleteCategory('"+cat.id+"')\">حذف</button>";
-    html+="</span></div>";
-  });
-  if(list) list.innerHTML=html;
-  ["manualCategory","autoCategory"].forEach(function(id){var s=document.getElementById(id);if(s){var v=s.value;s.innerHTML=opts;if(v)s.value=v;}});
-}
-function editCategory(id){
-  var cat=(window.__cats||[]).find(function(x){return x.id===id});
-  if(!cat)return;
-  document.getElementById("catEditId").value=id;
-  document.getElementById("catName").value=cat.name||"";
-  document.getElementById("catVolume").value="";
-  document.getElementById("catDays").value=cat.expires_days||0;
-  document.getElementById("catIp").value=cat.ip_limit||0;
-  document.getElementById("catConn").value=cat.connection_limit||0;
-  document.getElementById("catSpeed").value="";
-  document.getElementById("catClean").value=(cat.clean_ips||[]).join("\n");
-  document.getElementById("catRandom").checked=!!cat.random_name;
-  document.getElementById("catSingle").checked=!!cat.single_user;
-  showToast("در حال ویرایش: "+cat.name);
-}
-
-async function createCategory(){
-  var body={name:(document.getElementById("catName").value||"").trim()||"دسته جدید",
-    limit_value:Number(document.getElementById("catVolume").value||0),
-    limit_unit:document.getElementById("catVolumeUnit").value,
-    expires_days:Number(document.getElementById("catDays").value||0),
-    ip_limit:Number(document.getElementById("catIp").value||0),
-    connection_limit:Number(document.getElementById("catConn").value||0),
-    speed_limit_value:Number(document.getElementById("catSpeed").value||0),
-    clean_ips:(document.getElementById("catClean").value||"").trim(),
-    random_name:!!document.getElementById("catRandom").checked,
-    single_user:!!document.getElementById("catSingle").checked};
-  var editId=(document.getElementById("catEditId")||{}).value||"";
-  var res;
-  if(editId){
-    res=await api("/api/categories/"+encodeURIComponent(editId),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  } else {
-    res=await api("/api/categories",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  }
-  if(res&&res.ok){
-    showToast(editId?"ویرایش شد":"ساخته شد");
-    document.getElementById("catName").value="";
-    document.getElementById("catEditId").value="";
-    await loadCategoriesUI();
-  }
-}
-async function deleteCategory(id){
-  if(!confirm("حذف؟"))return;
-  var res=await api("/api/categories/"+encodeURIComponent(id),{method:"DELETE"});
-  if(res&&res.ok){showToast("حذف شد");await loadCategoriesUI();}
-}
-
-refresh();
-setInterval(refresh, 3000);
-
-
-</script>
-
-<!-- ===================================================== -->
-<!-- POST LOGIN REGION / DOMAIN NOTICE -->
-<!-- ===================================================== -->
-
-<div
-    id="regionNotice"
-    style="
-        display:none;
-        position:fixed;
-        inset:0;
-        z-index:99999;
-        align-items:center;
-        justify-content:center;
-        padding:20px;
-        background:rgba(2,6,23,.78);
-        backdrop-filter:blur(18px);
-        -webkit-backdrop-filter:blur(18px);
-    "
->
-    <div
-        style="
-            width:min(560px,100%);
-            position:relative;
-            overflow:hidden;
-            border:1px solid rgba(245,158,11,.28);
-            border-radius:26px;
-            padding:26px;
-            background:linear-gradient(145deg,rgba(30,25,8,.98),rgba(10,12,20,.98));
-            box-shadow:0 30px 100px rgba(0,0,0,.55),0 0 60px rgba(245,158,11,.10);
-            font-family:"Vazirmatn",sans-serif;
-        "
-    >
-        <div
-            style="
-                position:absolute;
-                width:180px;
-                height:180px;
-                left:-70px;
-                top:-90px;
-                border-radius:999px;
-                background:rgba(245,158,11,.12);
-                filter:blur(35px);
-                pointer-events:none;
-            "
-        ></div>
-
-        <div style="display:flex;align-items:flex-start;gap:14px;position:relative;">
-            <div
-                style="
-                    flex:0 0 auto;
-                    width:54px;
-                    height:54px;
-                    display:flex;
-                    align-items:center;
-                    justify-content:center;
-                    border-radius:17px;
-                    color:#fbbf24;
-                    border:1px solid rgba(251,191,36,.25);
-                    background:rgba(245,158,11,.10);
-                "
-            >
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path d="M12 3 2.8 19a1.4 1.4 0 0 0 1.22 2h15.96a1.4 1.4 0 0 0 1.22-2L12 3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
-                    <path d="M12 9v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-                    <circle cx="12" cy="16.8" r="1" fill="currentColor"/>
-                </svg>
-            </div>
-
-            <div style="min-width:0;flex:1;">
-                <div style="font-size:18px;font-weight:900;color:#fff;line-height:1.5;">به بهترین نسخه PX Panel خوش اومدید عشقا 💙</div>
-                <div style="margin-top:5px;font-size:11px;color:rgba(255,255,255,.45);">کانال تلگرام: LogicSec</div>
-            </div>
-
-            <button
-                type="button"
-                onclick="closeRegionNotice()"
-                aria-label="بستن"
-                style="
-                    width:38px;
-                    height:38px;
-                    flex:0 0 auto;
-                    border:1px solid rgba(255,255,255,.08);
-                    border-radius:12px;
-                    color:rgba(255,255,255,.65);
-                    background:rgba(255,255,255,.04);
-                    cursor:pointer;
-                    display:flex;
-                    align-items:center;
-                    justify-content:center;
-                "
-            >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <path d="m7 7 10 10M17 7 7 17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-                </svg>
-            </button>
-        </div>
-
-        <div
-            style="
-                position:relative;
-                margin-top:20px;
-                padding:17px;
-                border:1px solid rgba(251,191,36,.16);
-                border-radius:18px;
-                background:rgba(245,158,11,.055);
-                color:rgba(255,255,255,.82);
-                font-size:13px;
-                line-height:2.05;
-                text-align:right;
-            "
-        >
-            <div style="color:rgba(255,255,255,.85);font-size:13px;line-height:2;margin-bottom:10px;">
-              به <b style="color:#60a5fa;">PX Panel</b> خوش آمدید. پنل آماده مدیریت کانفیگ‌ها، دسته‌بندی و سابسکریپشن است.
-            </div>
-            <div style="margin-top:8px;padding:12px;border-radius:12px;background:rgba(37,99,235,.1);border:1px solid rgba(96,165,250,.2);color:#93c5fd;font-size:12px;">
-              کانال تلگرام: <b>LogicSec</b>
-            </div>
-            <div style="margin-top:12px;color:rgba(255,255,255,.5);font-size:11px;line-height:1.9;">
-              اگر کانفیگ‌ها پینگ ندادند، دامنه ممکن است فیلتر شده باشد — دامنه جدید بسازید.
-            </div>
-        </div>
-
-        <button
-            type="button"
-            onclick="closeRegionNotice()"
-            style="
-                position:relative;
-                width:100%;
-                margin-top:15px;
-                min-height:46px;
-                border:1px solid rgba(251,191,36,.20);
-                border-radius:15px;
-                color:#17120a;
-                background:linear-gradient(135deg,#fbbf24,#f59e0b);
-                font-family:inherit;
-                font-weight:900;
-                cursor:pointer;
-            "
-        >
-            متوجه شدم
-        </button>
+<section class="page" id="page-groups">
+  <div class="page-head">
+    <div>
+      <div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span data-i18n="nav_groups">گروه‌ها</span></div>
+      <div class="page-sub">ساخـت گـروه و اختصـاص کانفیـگ هـای دستـی و خودکـار</div>
     </div>
+  </div>
+  <div class="g2">
+    <div class="card">
+      <div class="card-title">ساخت گروه جدیـد</div>
+      <div class="field"><label>نام گروه</label><input id="grpName" placeholder="مثلا اختصاصـی"></div>
+      <button class="btn btn-p" style="width:100%" onclick="createGroup()">ساخـت گروه</button>
+    </div>
+    <div class="card" style="padding:0">
+      <div style="padding:16px 18px;border-bottom:1px solid var(--card-b);font-weight:700">لیست گروه‌ها</div>
+      <div id="groupsList" style="padding:12px;max-height:480px;overflow:auto">...</div>
+    </div>
+  </div>
+</section>
+<section class="page" id="page-stats">
+  <div class="page-head">
+    <div>
+      <div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3v18h18"/><path d="M7 16l4-8 4 4 5-6"/></svg><span data-i18n="nav_stats">آمار</span></div>
+      <div class="page-sub" data-i18n="stats_sub">ترافیـک و اتصـالات · فیلتـر زمانـی</div>
+    </div>
+    <div class="range-tabs" id="rangeTabs">
+      <button class="range-tab" data-r="day" onclick="setRange('day',this)" data-i18n="r_day">روز</button>
+      <button class="range-tab" data-r="week" onclick="setRange('week',this)" data-i18n="r_week">هفتـه</button>
+      <button class="range-tab on" data-r="month" onclick="setRange('month',this)" data-i18n="r_month">مـاه</button>
+      <button class="range-tab" data-r="all" onclick="setRange('all',this)" data-i18n="r_all">کـل</button>
+    </div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="metric-label" data-i18n="m_traffic">ترافیـک</div><div class="metric-val" id="sTraffic">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_conns">اتصـالات</div><div class="metric-val" id="sConns">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_links">کانفیـگ فعـال</div><div class="metric-val" id="sActive">—</div></div>
+    <div class="metric"><div class="metric-label" data-i18n="m_uptime">آپتایـم</div><div class="metric-val" id="sUptime" style="font-size:16px">—</div></div>
+  </div>
+  <div class="card"><div class="card-title" data-i18n="panel_info">اطلاعات کل پنل</div><div id="panelInfo" style="font-size:13px;color:var(--t2);line-height:2"></div></div>
+</section>
+
+<section class="page" id="page-logs">
+  <div class="page-head">
+    <div><div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg><span data-i18n="nav_logs">لاگ فعالیت</span></div></div>
+    <button class="btn btn-sm" onclick="loadLogs()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.1-3.4L23 10"/></svg></button>
+  </div>
+  <div class="card" id="logsBox"><div style="text-align:center;color:var(--t3);padding:28px">...</div></div>
+</section>
+
+<section class="page" id="page-settings">
+  <div class="page-head"><div><div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/></svg><span data-i18n="nav_settings">تنظیمات</span></div></div></div>
+  <div class="card">
+    <div class="card-title" data-i18n="theme">تــــم هـا</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-p" onclick="setTheme('dark')" data-i18n="theme_dark">تـم دارک</button>
+      <button class="btn" onclick="setTheme('light')" data-i18n="theme_light">تـم روشـن</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" data-i18n="lang_label">زبـان / Language</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-p" onclick="setLang('fa')">فارسـی</button>
+      <button class="btn" onclick="setLang('en')">English</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" data-i18n="change_pw">تغییر رمز عبـور</div>
+    <div class="field"><label data-i18n="pw_cur">رمز فعلـی</label><input type="password" id="pwCur"></div>
+    <div class="field"><label data-i18n="pw_new">رمـز جدیـد</label><input type="password" id="pwNew"></div>
+    <div class="field"><label data-i18n="pw_cf">تکـرار رمـز</label><input type="password" id="pwCf"></div>
+    <button class="btn btn-p" onclick="doChangePw()"><span data-i18n="btn_save">ذخیـره</span></button>
+  </div>
+  
+  <div class="card">
+    <div class="card-title">امنیت بیشتـر</div>
+    <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:12px">پـس از 5 تـلاش ناموفـق، ایپـی به مدت 30 دقیقه مسدود می‌شود.</p>
+    <div id="secStatus" style="font-size:12px;color:var(--t2);margin-bottom:10px">—</div>
+    <button class="btn btn-sm" onclick="loadSecurity()">بروزرسانی وضعیـت</button>
+    <button class="btn btn-sm btn-d" onclick="unlockAllIps()">رفع مسدودی همـه ایپــی هــا</button>
+  </div>
+<div class="card">
+    <div class="card-title">بــک آپ و بازیابــی</div>
+    <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:14px">در صورت خرابی پنل، بک‌آپ را دانلود کنید و در پنل جدید وارد کنید.</p>
+    <div class="g2" style="margin-bottom:12px">
+      <button class="btn btn-p" style="width:100%" onclick="downloadBackup('users')">دانلود بک‌آپ کاربران</button>
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="downloadBackup('bot')">دانلود بک‌آپ ربات</button>
+    </div>
+    <div class="field">
+      <label>وارد کردن بـک‌آپ کاربران</label>
+      <input type="file" id="restoreUsersFile" accept="application/json,.json" style="padding:10px">
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn btn-sm" onclick="restoreUsers('merge')">ادغام بــــا فعلـی</button>
+        <button class="btn btn-sm btn-d" onclick="restoreUsers('replace')">جایگزینی کامـل</button>
+      </div>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label>وارد کردن بــک آپ ربـات</label>
+      <input type="file" id="restoreBotFile" accept="application/json,.json" style="padding:10px">
+      <button class="btn btn-sm" style="margin-top:8px" onclick="restoreBot()">بازیابـی ربـات</button>
+    </div>
+  </div>
+</section>
+
+
+<section class="page" id="page-news">
+  <div class="page-head">
+    <div>
+      <div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/></svg><span data-i18n="nav_news">اخبار</span></div>
+      
+    </div>
+    <button class="btn btn-sm" onclick="loadNews(true)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.1-3.4L23 10"/></svg> <span data-i18n="refresh_news">بروزرسانی اطلاعیه</span></button>
+  </div>
+  <div class="card" id="newsCard">
+    <div class="card-title" id="newsTitle">—</div>
+    <div id="newsBody" style="white-space:pre-wrap;line-height:1.9;color:var(--t2);font-size:13px">...</div>
+    <div id="newsMeta" style="margin-top:14px;font-size:11px;color:var(--t3)"></div>
+  </div>
+</section>
+
+<section class="page" id="page-admins">
+  <div class="page-head">
+    <div>
+      <div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><span data-i18n="nav_admins">(نسخـه دمـو) ادمیـن هــا</span></div>
+      <div class="page-sub" data-i18n="admins_sub">ساخت اکانت ادمین با دسترسی سفارشـی</div>
+    </div>
+  </div>
+  <div class="g2">
+    <div class="card">
+      <div class="card-title" data-i18n="admin_create">ساخـت اکانـت ادمیـن</div>
+      <div class="field"><label data-i18n="admin_user">نام کاربـری</label><input id="adUser" placeholder="user1" style="direction:ltr;text-align:left"></div>
+      <div class="form-row">
+        <div class="field"><label data-i18n="admin_pw">رمز عبـور</label><input id="adPw" type="password"></div>
+        <div class="field"><label data-i18n="admin_pw2">تکرار رمـز</label><input id="adPw2" type="password"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label data-i18n="label_limit">حجـم</label><input id="adLimit" type="number" value="0" min="0"></div>
+        <div class="field"><label data-i18n="label_unit">واحـد</label><select id="adUnit"><option>GB</option><option>MB</option></select></div>
+      </div>
+      <div class="field"><label data-i18n="label_days">مدت اعتبـار (روز)</label><input id="adDays" type="number" value="0" min="0"></div>
+      <div class="card-title" style="margin-top:8px" data-i18n="admin_perms">دسترسی‌ها</div>
+      <div id="adPerms" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px"></div>
+      <button class="btn btn-p" style="width:100%;margin-top:14px" onclick="createAdmin()" data-i18n="admin_btn">ساخت اکانت</button>
+    </div>
+    <div class="card" style="padding:0">
+      <div style="padding:16px 18px;border-bottom:1px solid var(--card-b);font-weight:700" data-i18n="admin_list">لیست ادمین‌ها</div>
+      <div id="adminsList" style="padding:12px;max-height:480px;overflow:auto"><div style="color:var(--t3);text-align:center;padding:20px">...</div></div>
+    </div>
+  </div>
+</section>
+
+
+<section class="page" id="page-donate">
+  <div class="page-head" style="justify-content:center">
+    <div>
+      <div class="page-title" style="justify-content:center">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+        <span data-i18n="nav_donate">حمایـت مالــــی</span>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;justify-content:center;width:100%">
+  <div class="card" style="max-width:560px;width:100%;line-height:2;font-size:14px;color:var(--t2);text-align:center">
+    <div style="font-size:16px;font-weight:800;color:var(--t1);margin-bottom:12px">💖 حمایت از پروژه (اختیاری)</div>
+    <p>اگه از پروژه خوشتون اومده یا براتون مفید بوده، می‌تونید با یه حمایت کوچیک مالی به ادامه‌ی توسعه و بهتر شدن پروژه کمک کنید. 🫶🏻✨</p>
+    <p style="margin-top:10px">💰 هر مقدار حمایتی، حتی کم، برای ما ارزشمنده و باعث میشه با انگیزه‌ی بیشتری ادامه بدیم! 🚀❤️‍🔥</p>
+    <p style="margin-top:10px">🔗 لینک حمایت مالی:</p>
+    <div style="margin-top:12px;display:flex;justify-content:center"><a href="https://reymit.ir/moditor" target="_blank" rel="noopener" class="btn btn-p" style="display:inline-flex;text-decoration:none">🙂 reymit.ir/moditor</a></div>
+    <p style="margin-top:16px;font-size:13px;color:var(--t3)">🙏🏻 ممنون از حمایت و همراهی‌تون عشقا! ❤️‍🔥🌹</p>
+    <p style="margin-top:8px;font-size:12px;color:var(--t3)">کاملاً اختیاری است و هیچ اجباری وجود ندارد.</p>
+  </div>
+  </div>
+</section>
+
+<section class="page" id="page-support">
+  <div class="page-head"><div><div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/></svg><span data-i18n="nav_support">پشتیبانی</span></div></div></div>
+  <div class="support-grid">
+    <a class="support-tile" href="https://github.com/iran-px-panel/pxpanel" target="_blank" rel="noopener">
+      <div class="support-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.2 11.4.6.1.82-.26.82-.58v-2.03c-3.34.73-4.03-1.61-4.03-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.1-.75.08-.74.08-.74 1.21.09 1.85 1.24 1.85 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.46-1.33-5.46-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.8 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57C20.56 21.8 24 17.3 24 12 24 5.37 18.63 0 12 0z"/></svg></div>
+      <div><div class="support-label" data-i18n="github">گیت هـاب پروژه</div><div class="support-val">iran-px-panel/pxpanel</div></div>
+    </a>
+    <a class="support-tile" href="https://t.me/logic_sec" target="_blank" rel="noopener">
+      <div class="support-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12s5.37 12 12 12 12-5.37 12-12S18.63 0 12 0zm5.56 8.2-1.86 8.77c-.14.62-.5.77-1.01.48l-2.8-2.06-1.35 1.3c-.15.15-.27.27-.55.27l.2-2.84 5.18-4.68c.22-.2-.05-.31-.35-.12l-6.4 4.03-2.76-.86c-.6-.19-.61-.6.12-.89l10.78-4.16c.5-.18.94.12.78.86z"/></svg></div>
+      <div><div class="support-label" data-i18n="telegram">کانال تلگـرام</div><div class="support-val">@logic_sec</div></div>
+    </a>
+    <a class="support-tile" href="https://t.me/logictop12" target="_blank" rel="noopener">
+      <div class="support-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
+      <div><div class="support-label" data-i18n="channel">گروه تلگـرام (پشتیبانی)</div><div class="support-val">t.me/logictop12</div></div>
+    </a>
+  </div>
+</section>
+
+<section class="page" id="page-telegram">
+  <div class="page-head">
+    <div>
+      <div class="page-title">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M12 0C5.37 0 0 5.37 0 12s5.37 12 12 12 12-5.37 12-12S18.63 0 12 0zm5.56 8.2-1.86 8.77c-.14.62-.5.77-1.01.48l-2.8-2.06-1.35 1.3c-.15.15-.27.27-.55.27l.2-2.84 5.18-4.68c.22-.2-.05-.31-.35-.12l-6.4 4.03-2.76-.86c-.6-.19-.61-.6.12-.89l10.78-4.16c.5-.18.94.12.78.86z"/></svg>
+        <span data-i18n="nav_telegram">پی ایکس بات</span>
+      </div>
+      <div class="page-sub" data-i18n="tg_sub">توکن ربات و آیدی عددی ادمین · فعال‌سازی خودکار و وب‌هوک</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" data-i18n="tg_config">پیکربندی ربات</div>
+    <div class="field"><label data-i18n="tg_token">توکن ربات (BotFather)</label><input id="tgToken" placeholder="123456:ABC-DEF..." autocomplete="off"></div>
+    <div class="field"><label data-i18n="tg_admin">آیدی عددی ادمین</label><input id="tgAdmin" placeholder="123456789" inputmode="numeric"></div>
+    <div class="field" style="display:flex;align-items:center;gap:10px">
+      <label class="switch"><input type="checkbox" id="tgWebhook" checked><span class="slider"></span></label>
+      <span data-i18n="tg_webhook" style="font-size:13px;color:var(--t2)">فعال‌سازی Webhook (پیشنهادی روی Railway)</span>
+    </div>
+    <div id="tgStatus" style="font-size:12px;color:var(--t3);margin:10px 0"></div>
+    <button class="btn btn-p" style="width:100%" onclick="saveTelegram()">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      <span data-i18n="tg_activate">ذخیره و فعال‌سازی ربات</span>
+    </button>
+  </div>
+  <div class="card">
+    <div class="card-title" data-i18n="tg_help">راهنما</div>
+    <ol style="color:var(--t2);font-size:13px;line-height:2;padding-right:18px">
+      <li data-i18n="tg_h1">از @BotFather یک ربات بساز و توکن را کپی کن</li>
+      <li data-i18n="tg_h2">آیدی عددی خودت را از @userinfobot بگیر</li>
+      <li data-i18n="tg_h3">ذخیره کن — وب‌هوک خودکار روی دامنه Railway ست می‌شود</li>
+    </ol>
+  </div>
+</section>
+
+</main>
+
+<!-- Result modal after create -->
+<div class="modal-bg" id="resultModal">
+  <div class="modal">
+    <div class="modal-title" data-i18n="created_title">کانفیگ ساخته شد</div>
+    <div class="field"><label>VLESS</label><div class="link-box" id="resVless">—</div>
+      <button class="btn btn-p btn-sm" style="width:100%" onclick="copyText(document.getElementById('resVless').textContent)">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <span data-i18n="copy_vless">کپی VLESS</span>
+      </button>
+    </div>
+    <div class="field" style="margin-top:14px"><label data-i18n="sub_label">سابسکریپشن</label><div class="link-box" id="resSub">—</div>
+      <button class="btn btn-sm" style="width:100%" onclick="copyText(document.getElementById('resSub').textContent)">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+        <span data-i18n="copy_sub">کپی ساب</span>
+      </button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeResult()">OK</button>
+    </div>
+  </div>
 </div>
 
-<script>
-(function(){
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("login") === "1") {
-        const modal = document.getElementById("regionNotice");
-        if (modal) {
-            modal.style.display = "flex";
-            document.body.style.overflow = "hidden";
-        }
-        const cleanUrl = window.location.pathname;
-        window.history.replaceState({}, document.title, cleanUrl);
-    }
-})();
+<div class="modal-bg" id="panelModal">
+  <div class="modal">
+    <div class="modal-title" id="panelModalTitle">...</div>
+    <div id="panelModalBody" style="color:var(--t2);font-size:13px;line-height:1.8"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="document.getElementById('panelModal').classList.remove('open')">OK</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
 
-function closeRegionNotice(){
-    const modal = document.getElementById("regionNotice");
-    if (modal) modal.style.display = "none";
-    document.body.style.overflow = "";
+<script>
+const I18N={
+fa:{sec_panel:'پنل',sec_sys:'سیستم',nav_dash:'داشبورد',nav_configs:'کانفیگ‌ها',nav_groups:'گروه‌ها',nav_create:'ساخت کانفیگ',nav_stats:'آمار',nav_logs:'لاگ فعالیت',nav_settings:'تنظیمات',nav_support:'پشتیبانی',nav_donate:'حمایت مالی',nav_news:'اخبار',nav_admins:'ادمین‌ها',refresh_news:'بروزرسانی اطلاعیه',admins_sub:'ساخت اکانت ادمین با دسترسی سفارشی',admin_create:'ساخت اکانت ادمین',admin_user:'نام کاربری',admin_pw:'رمز عبور',admin_pw2:'تکرار رمز',admin_perms:'دسترسی‌ها',admin_btn:'ساخت اکانت',admin_list:'لیست ادمین‌ها',refresh:'بروزرسانی',refresh_stats:'بروزرسانی آمار',refresh_panel:'بروزرسانی پنل',nav_telegram:'ربات تلگرام',tg_sub:'توکن ربات و آیدی عددی ادمین · فعال‌سازی خودکار و وب‌هوک',tg_config:'پیکربندی ربات',tg_token:'توکن ربات (BotFather)',tg_admin:'آیدی عددی ادمین',tg_webhook:'فعال‌سازی Webhook (پیشنهادی روی Railway)',tg_activate:'ذخیره و فعال‌سازی ربات',tg_help:'راهنما',tg_h1:'از @BotFather یک ربات بساز و توکن را کپی کن',tg_h2:'آیدی عددی خودت را از @userinfobot بگیر',tg_h3:'ذخیره کن — وب‌هوک خودکار روی دامنه Railway ست می‌شود',logout:'خروج',loading:'در حال بارگذاری...',m_conns:'اتصالات فعال',m_traffic:'ترافیک کل',m_links:'کانفیگ‌ها',m_uptime:'آپتایم سرور',quick_create:'ساخت کانفیگ',quick_create_desc:'ساخت دستی با محدودیت ترافیک، سرعت، تعداد و انقضا',auto_create:'ساخت خودکار (پیشنهادی)',auto_create_desc:'ساخت سریع با تنظیمات بهینه · لینک VLESS و ساب',configs_sub:'مدیریت لینک‌ها · VLESS و ساب',th_name:'نام',th_proto:'پروتکل',th_status:'وضعیت',th_usage:'مصرف',th_ops:'عملیات',manual_create:'ساخت دستی',label_name:'نام',label_proto:'پروتکل',label_count:'تعداد کانفیگ در ساب (۱–۴۰)',label_limit:'محدودیت حجم',label_unit:'واحد',label_days:'انقضا (روز)',label_ip:'محدودیت IP',label_speed:'سرعت (Mbps)',btn_create:'ساخت',btn_auto:'ساخت خودکار',auto_desc:'با یک کلیک کانفیگ بهینه ساخته می‌شود. بعد از ساخت لینک VLESS و ساب در اختیار شماست.',stats_sub:'ترافیک و اتصالات · فیلتر زمانی',r_day:'روز',r_week:'هفته',r_month:'ماه',r_all:'کل',panel_info:'اطلاعات کل پنل',lang_label:'زبان',change_pw:'تغییر رمز عبور',pw_cur:'رمز فعلی',pw_new:'رمز جدید',pw_cf:'تکرار رمز',btn_save:'ذخیره',github:'گیت‌هاب',telegram:'تلگرام',channel:'کانال پشتیبان',theme:'تم',theme_dark:'تم تیره',theme_light:'تم روشن',created_title:'کانفیگ ساخته شد',copy_vless:'کپی VLESS',copy_sub:'کپی ساب',sub_label:'سابسکریپشن'},
+en:{sec_panel:'PANEL',sec_sys:'SYSTEM',nav_dash:'Dashboard',nav_configs:'Configs',nav_groups:'Groups',nav_create:'Create Config',nav_stats:'Statistics',nav_logs:'Activity Log',nav_settings:'Settings',nav_support:'Support',nav_donate:'Donate',nav_news:'News',nav_admins:'Admins',refresh_news:'Refresh news',admins_sub:'Create admin accounts with custom access',admin_create:'Create admin account',admin_user:'Username',admin_pw:'Password',admin_pw2:'Confirm password',admin_perms:'Permissions',admin_btn:'Create account',admin_list:'Admin list',refresh:'Refresh',refresh_stats:'Refresh stats',refresh_panel:'Update panel',nav_telegram:'Telegram bot',tg_sub:'Bot token and numeric admin ID · auto activate and webhook',tg_config:'Bot configuration',tg_token:'Bot token (BotFather)',tg_admin:'Admin numeric ID',tg_webhook:'Enable Webhook (recommended on Railway)',tg_activate:'Save and activate bot',tg_help:'Guide',tg_h1:'Create a bot with @BotFather and copy the token',tg_h2:'Get your numeric ID from @userinfobot',tg_h3:'Save — webhook is set automatically on Railway domain',logout:'Logout',loading:'Loading...',m_conns:'Active connections',m_traffic:'Total traffic',m_links:'Configs',m_uptime:'Server uptime',quick_create:'Create Config',quick_create_desc:'Manual create with traffic, speed, count and expiry',auto_create:'Auto Create (Suggested)',auto_create_desc:'Quick optimal create · VLESS and Sub links',configs_sub:'Manage links · VLESS and Sub',th_name:'Name',th_proto:'Protocol',th_status:'Status',th_usage:'Usage',th_ops:'Actions',manual_create:'Manual create',label_name:'Name',label_proto:'Protocol',label_count:'Configs in sub (1–40)',label_limit:'Traffic limit',label_unit:'Unit',label_days:'Expiry (days)',label_ip:'IP limit',label_speed:'Speed (Mbps)',btn_create:'Create',btn_auto:'Auto create',auto_desc:'One click creates an optimal config. VLESS and Sub links will be shown.',stats_sub:'Traffic and connections · time filter',r_day:'Day',r_week:'Week',r_month:'Month',r_all:'All',panel_info:'Panel overview',lang_label:'Language',change_pw:'Change password',pw_cur:'Current password',pw_new:'New password',pw_cf:'Confirm password',btn_save:'Save',github:'GitHub',telegram:'Telegram',channel:'Support channel',theme:'Theme',theme_dark:'Dark theme',theme_light:'Light theme',created_title:'Config created',copy_vless:'Copy VLESS',copy_sub:'Copy Sub',sub_label:'Subscription'}
+};
+let lang=localStorage.getItem('px_lang')||'fa';
+let statRange='month';
+function t(k){return (I18N[lang]||I18N.fa)[k]||k}
+function applyLang(){
+  document.getElementById('htmlRoot').lang=lang;
+  document.getElementById('htmlRoot').dir=lang==='fa'?'rtl':'ltr';
+  document.body.classList.toggle('en',lang==='en');
+  document.querySelectorAll('[data-i18n]').forEach(el=>{const k=el.getAttribute('data-i18n');if(I18N[lang][k])el.textContent=I18N[lang][k]});
+  const tl=document.getElementById('themeLabel');
+  if(tl) tl.textContent=document.documentElement.classList.contains('light')?t('theme_dark'):t('theme_light');
+}
+function setLang(l){lang=l;localStorage.setItem('px_lang',l);applyLang();toast(l==='fa'?'زبان فارسی':'English')}
+
+function setTheme(mode){
+  if(mode==='light') document.documentElement.classList.add('light');
+  else document.documentElement.classList.remove('light');
+  localStorage.setItem('px_theme',mode);
+  applyLang();
+}
+function toggleTheme(){
+  const isLight=document.documentElement.classList.contains('light');
+  setTheme(isLight?'dark':'light');
+}
+(function(){const th=localStorage.getItem('px_theme')||'dark';setTheme(th)})();
+
+const sb=document.getElementById('sidebar'),main=document.getElementById('main');
+document.getElementById('sbToggle').onclick=()=>{
+  sb.classList.toggle('collapsed');
+  main.classList.toggle('expanded',sb.classList.contains('collapsed'));
+  localStorage.setItem('sb_c',sb.classList.contains('collapsed')?'1':'0');
+};
+if(localStorage.getItem('sb_c')==='1'){sb.classList.add('collapsed');main.classList.add('expanded')}
+document.getElementById('mobMenuBtn').onclick=()=>{sb.classList.add('open');document.getElementById('overlay').classList.add('show')};
+document.getElementById('overlay').onclick=()=>{sb.classList.remove('open');document.getElementById('overlay').classList.remove('show')};
+
+function goPage(name){
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('on',n.dataset.page===name));
+  document.querySelectorAll('.page').forEach(p=>p.classList.toggle('on',p.id==='page-'+name));
+  sb.classList.remove('open');document.getElementById('overlay').classList.remove('show');
+  window.scrollTo({top:0,behavior:'smooth'});
+  if(name==='logs')loadLogs();
+  if(name==='configs'||name==='dash'||name==='stats')refreshAll();
+}
+document.querySelectorAll('.nav-item').forEach(el=>el.addEventListener('click',()=>goPage(el.dataset.page)));
+
+function toast(msg){
+  const el=document.getElementById('toast');
+  el.textContent=msg;el.classList.add('show');
+  clearTimeout(window.__tt);window.__tt=setTimeout(()=>el.classList.remove('show'),2200);
+}
+async function api(url,opts={}){
+  try{
+    const r=await fetch(url,{cache:'no-store',credentials:'same-origin',...opts});
+    if(r.status===401){location.href='/login';return null}
+    let data=null;try{data=await r.json()}catch{data={ok:false}}
+    if(!r.ok){toast(data.detail||data.error||'Error');return null}
+    return data;
+  }catch(e){toast(lang==='fa'?'ارتباط برقرار نشد':'Connection failed');return null}
+}
+function fmtB(b){b=Number(b)||0;if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**3)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+
+async function refreshAll(){
+  if(typeof loadGroups==='function') try{await loadGroups()}catch(e){}
+  const links=await api('/api/links');
+  if(!links)return;
+  const arr=Array.isArray(links.links)?links.links:(Array.isArray(links)?links:[]);
+  document.getElementById('mLinks').textContent=arr.length;
+  let active=0,used=0;
+  arr.forEach(l=>{if(l.active!==false)active++;used+=Number(l.used_bytes||0)});
+  document.getElementById('mTraffic').textContent=fmtB(used);
+  document.getElementById('sTraffic').textContent=fmtB(used);
+  document.getElementById('sActive').textContent=active;
+  document.getElementById('lastUpd').textContent=(lang==='fa'?'بروزرسانی: ':'Updated: ')+new Date().toLocaleTimeString(lang==='fa'?'fa-IR':'en-US');
+  try{
+    const c=await api('/api/connections');
+    const cnt=(c&&c.connections)?c.connections.length:((c&&typeof c.count==='number')?c.count:0);
+    document.getElementById('mConns').textContent=cnt;
+    document.getElementById('sConns').textContent=cnt;
+  }catch(e){}
+  try{
+    const h=await fetch('/health',{cache:'no-store'}).then(r=>r.json());
+    if(h&&h.uptime){
+      document.getElementById('mUptime').textContent=h.uptime;
+      const su=document.getElementById('sUptime');if(su)su.textContent=h.uptime;
+    }
+  }catch(e){}
+    __allLinks=arr;
+  softUpdateLinks(arr);
+  document.getElementById('panelInfo').innerHTML=lang==='fa'
+    ?`کل کانفیگ: <b>${arr.length}</b> · فعال: <b>${active}</b> · مصرف: <b>${fmtB(used)}</b> · بازه: <b>${statRange}</b>`
+    :`Total: <b>${arr.length}</b> · Active: <b>${active}</b> · Usage: <b>${fmtB(used)}</b> · Range: <b>${statRange}</b>`;
 }
 
-document.addEventListener("keydown", function(event){
-    if (event.key === "Escape") closeRegionNotice();
-});
-</script>
 
+function linkBadgeClass(l){
+  const conn=Number(l.connected_ips||0);
+  const used=Number(l.used_bytes||0), lim=Number(l.limit_bytes||0);
+  let usagePct=lim>0?(used/lim)*100:0;
+  let expWarn=false, expDead=false;
+  if(l.expires_at){try{const ms=new Date(l.expires_at)-Date.now();if(ms<=0)expDead=true;else if(ms<3*864e5)expWarn=true}catch(e){}}
+  if(expDead||usagePct>=90) return 'conn-badge red';
+  if(expWarn||usagePct>=70) return 'conn-badge orange';
+  if(conn>0) return 'conn-badge green';
+  return 'conn-badge gray';
+}
+function softUpdateLinks(arr){
+  const tb=document.getElementById('linksTable');
+  if(!tb) return;
+  const rows=[...tb.querySelectorAll('tr[data-uid]')];
+  const existing=rows.map(r=>r.getAttribute('data-uid'));
+  const incoming=arr.map(l=>String(l.uuid||l.id||''));
+  const same = existing.length===incoming.length && existing.every((id,i)=>id===incoming[i]);
+  // اگر در حال درگ یا انتخاب هستیم، فقط سلول‌ها را آپدیت کن
+  const selecting = document.querySelectorAll('.cfg-chk:checked').length>0;
+  const dragging = !!__dragUid;
+  if(!same || existing.length===0){
+    if(dragging || selecting){
+      // فقط آمار ردیف‌های موجود را آپدیت کن، ساختار را نشکن
+      window.__linksMap = window.__linksMap || {};
+      arr.forEach(l=>{
+        const uid=String(l.uuid||l.id||'');
+        window.__linksMap[uid]=l;
+        const tr=tb.querySelector(`tr[data-uid="${uid}"]`);
+        if(!tr) return;
+        patchLinkRow(tr, l);
+      });
+      return;
+    }
+    renderLinks(arr);
+    return;
+  }
+  window.__linksMap = window.__linksMap || {};
+  arr.forEach(l=>{
+    const uid=String(l.uuid||l.id||'');
+    window.__linksMap[uid]=l;
+    const tr=tb.querySelector(`tr[data-uid="${uid}"]`);
+    if(tr) patchLinkRow(tr, l);
+  });
+}
+function patchLinkRow(tr, l){
+  const conn=Number(l.connected_ips||0);
+  const badge=tr.querySelector('.conn-badge');
+  if(badge){ badge.textContent=String(conn); badge.className=linkBadgeClass(l); }
+  const usageCell=tr.querySelector('[data-usage]');
+  if(usageCell){
+    usageCell.textContent = fmtB(l.used_bytes) + (l.limit_bytes?(' / '+fmtB(l.limit_bytes)):'');
+  }
+  // وضعیت سوئیچ را اگر کاربر همین الان عوض نکرده دست نزن — فقط اگر API فرق دارد و فوکوس نیست
+  const sw=tr.querySelector('.switch input[type=checkbox]');
+  if(sw && document.activeElement!==sw){
+    const on=l.active!==false&&!l.expired;
+    if(sw.checked!==on) sw.checked=on;
+  }
+}
+function renderLinks(arr){
+  const tb=document.getElementById('linksTable');
+  if(!arr.length){tb.innerHTML=`<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:28px">${lang==='fa'?'کانفیگی نیست':'No configs'}</td></tr>`;updateBulkBar();return}
+  window.__linksMap={};
+  const catMap=window.__catMap||{};
+  // preserve checked state
+  const prevChecked=new Set([...document.querySelectorAll('.cfg-chk:checked')].map(c=>c.value));
+  tb.innerHTML=arr.map(l=>{
+    const uid=l.uuid||l.id||'';
+    window.__linksMap[uid]=l;
+    const name=l.label||l.name||String(uid).slice(0,8);
+    const proto=l.protocol||'vless-ws';
+    const on=l.active!==false&&!l.expired;
+    const conn=Number(l.connected_ips||0);
+    const gname=catMap[String(l.category_id||'')]||'';
+    const chk=prevChecked.has(uid)?'checked':'';
+    return `<tr draggable="true" data-uid="${esc(uid)}" ondragstart="cfgDragStart(event)" ondragover="cfgDragOver(event)" ondrop="cfgDrop(event)" ondragend="cfgDragEnd(event)">
+      <td style="text-align:center;padding:10px 8px;vertical-align:middle"><input type="checkbox" class="cfg-chk" value="${esc(uid)}" ${chk} onchange="updateBulkBar()" style="width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer"></td>
+      <td style="cursor:grab;color:var(--t3);user-select:none" title="کشیدن">⋮⋮</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <b>${esc(name)}</b>
+          <span class="${linkBadgeClass(l)}" title="${lang==='fa'?'متصل الان':'Online now'}">${conn}</span>
+          ${gname?`<span style="font-size:10px;padding:2px 7px;border-radius:8px;background:var(--hover);color:var(--t3)">${esc(gname)}</span>`:''}
+        </div>
+      </td>
+      <td style="color:var(--t3);font-size:11px">${esc(proto)}</td>
+      <td><label class="switch"><input type="checkbox" ${on?'checked':''} onchange="toggleLink('${esc(uid)}',this.checked)"><span class="slider"></span></label></td>
+      <td data-usage>${fmtB(l.used_bytes)}${l.limit_bytes?(' / '+fmtB(l.limit_bytes)):''}</td>
+      <td class="ops">
+        <button class="btn btn-sm" onclick="copyLinkById('${esc(uid)}')" title="VLESS"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+        <button class="btn btn-sm" onclick="copySubById('${esc(uid)}')" title="Sub"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></button>
+        <a class="btn btn-sm" href="/info/${esc(uid)}" target="_blank" title="INFO" style="text-decoration:none"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></a>
+        <button class="btn btn-sm" onclick="resetUsage('${esc(uid)}')" title="Reset"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg></button>
+        <button class="btn btn-sm btn-d" onclick="deleteLink('${esc(uid)}')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>
+      </td>
+    </tr>`;
+  }).join('');
+  updateBulkBar();
+}
+function getLinkUrl(l){if(!l)return '';return l.vless_full||l.vless||l.vless_link||l.link||''}
+function getSubUrl(l){if(!l)return '';return l.sub||l.sub_url||l.info||''}
+async function copyText(text){
+  text=String(text||'').trim();
+  if(!text||text==='—'){toast(lang==='fa'?'لینکی نیست':'Nothing to copy');return}
+  try{
+    if(navigator.clipboard&&window.isSecureContext) await navigator.clipboard.writeText(text);
+    else{const ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta)}
+    toast(lang==='fa'?'کپی شد':'Copied');
+  }catch(e){toast(lang==='fa'?'کپی نشد':'Copy failed')}
+}
+async function copyLinkById(uid){await copyText(getLinkUrl((window.__linksMap||{})[uid]))}
+async function copySubById(uid){await copyText(getSubUrl((window.__linksMap||{})[uid]))}
+async function toggleLink(uid,state){
+  // optimistic UI — رنگ بلافاصله عوض می‌شود
+  if(window.__linksMap && window.__linksMap[uid]){
+    window.__linksMap[uid].active = !!state;
+    if(window.__linksMap[uid].expired && state) window.__linksMap[uid].expired = false;
+  }
+  if(typeof __allLinks !== 'undefined' && Array.isArray(__allLinks)){
+    const item = __allLinks.find(x => (x.uuid||x.id)===uid);
+    if(item) item.active = !!state;
+  }
+  const r=await api('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!!state})});
+  if(r===null){
+    // rollback
+    if(window.__linksMap && window.__linksMap[uid]) window.__linksMap[uid].active = !state;
+    refreshAll();
+    return;
+  }
+  toast(state?(lang==='fa'?'فعال شد':'Enabled'):(lang==='fa'?'غیرفعال شد':'Disabled'));
+}
+async function deleteLink(uid){
+  if(!confirm(lang==='fa'?'حذف شود؟':'Delete?'))return;
+  const r=await api('/api/links/'+uid,{method:'DELETE'});
+  if(r!==null){toast(lang==='fa'?'حذف شد':'Deleted');refreshAll()}
+}
+function showResult(data){
+  if(!data)return;
+  document.getElementById('resVless').textContent=getLinkUrl(data)||'—';
+  document.getElementById('resSub').textContent=getSubUrl(data)||'—';
+  document.getElementById('resultModal').classList.add('open');
+}
+function closeResult(){document.getElementById('resultModal').classList.remove('open')}
+document.getElementById('resultModal').addEventListener('click',e=>{if(e.target.id==='resultModal')closeResult()});
+
+async function doAutoCreate(){
+  toast(lang==='fa'?'در حال ساخت...':'Creating...');
+  const count=Math.max(1,Math.min(40,Number(document.getElementById('aCount')?.value)||1));
+  const protocol=document.getElementById('aProto')?.value||undefined;
+  let r=await api('/api/links/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config_count:count,protocol})});
+  if(!r){
+    r=await api('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:'auto-'+Date.now().toString(36).slice(-5),limit_value:0,limit_unit:'GB',config_count:count})});
+  }
+  if(r){showResult(r);refreshAll()}
+}
+async function doManualCreate(){
+  const body={
+    label:document.getElementById('cName').value||undefined,
+    protocol:document.getElementById('cProto')?.value||undefined,
+    category_id:document.getElementById('cGroup')?.value||'0',
+    config_count:Math.max(1,Math.min(40,Number(document.getElementById('cCount').value)||1)),
+    limit_value:Number(document.getElementById('cLimit').value)||0,
+    limit_unit:document.getElementById('cUnit').value||'GB',
+    expires_days:Number(document.getElementById('cDays').value)||0,
+    ip_limit:Number(document.getElementById('cIp').value)||0,
+    speed_limit_value:Number(document.getElementById('cSpeed').value)||0,
+    speed_limit_unit:'MBIT'
+  };
+  const r=await api('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r){showResult(r);refreshAll()}
+}
+async function doChangePw(){
+  const cur=document.getElementById('pwCur').value,nw=document.getElementById('pwNew').value,cf=document.getElementById('pwCf').value;
+  if(nw!==cf){toast(lang==='fa'?'رمزها یکی نیستند':'Passwords mismatch');return}
+  const r=await api('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw,repeat_password:cf})});
+  if(r){toast(lang==='fa'?'رمز تغییر کرد':'Password changed');document.getElementById('pwCur').value='';document.getElementById('pwNew').value='';document.getElementById('pwCf').value=''}
+}
+async function loadLogs(){
+  const box=document.getElementById('logsBox');
+  const data=await api('/api/activity');
+  const logs=Array.isArray(data)?data:(data&&data.logs)||[];
+  if(!logs.length){box.innerHTML=`<div style="text-align:center;color:var(--t3);padding:24px">${lang==='fa'?'لاگی نیست':'No logs'}</div>`;return}
+  box.innerHTML=logs.slice().reverse().map(l=>{
+    const tm=(l.time||l.ts||'').toString().slice(11,19)||'—';
+    return `<div class="log-item"><div class="log-time">${esc(tm)}</div><div class="log-msg">${esc(l.message||l.msg||JSON.stringify(l))}</div></div>`;
+  }).join('');
+}
+function setRange(r,el){
+  statRange=r;
+  document.querySelectorAll('#rangeTabs .range-tab').forEach(t=>t.classList.toggle('on',t.dataset.r===r));
+  refreshAll();toast(t('r_'+r));
+}
+function randomName(){
+  const chars='abcdefghijklmnopqrstuvwxyz0123456789';
+  let s='';
+  for(let i=0;i<10;i++) s+=chars[Math.floor(Math.random()*chars.length)];
+  if(/^[0-9]/.test(s)) s='a'+s.slice(1);
+  document.getElementById('cName').value=s;
+}
+async function panelUpdate(){
+  const m=document.getElementById('panelModal');
+  const t=document.getElementById('panelModalTitle');
+  const b=document.getElementById('panelModalBody');
+  t.textContent=lang==='fa'?'در حال بررسی آپدیت...':'Checking update...';
+  b.innerHTML='<div style="text-align:center;padding:20px"><div class="spin"></div></div>';
+  m.classList.add('open');
+  await new Promise(r=>setTimeout(r,1400));
+  t.textContent=lang==='fa'?'آپدیت پنل':'Panel update';
+  b.innerHTML=(lang==='fa'
+    ?'<p style="margin-bottom:12px">اپدیت با خطا مواجه شد. اپدیت را دستی انجام دهید.</p><a href="https://github.com/iran-px-panel/pxpanel" target="_blank" rel="noopener" style="color:var(--accent2);font-weight:700">github.com/iran-px-panel/pxpanel</a>'
+    :'<p style="margin-bottom:12px">Update failed. Please update manually.</p><a href="https://github.com/iran-px-panel/pxpanel" target="_blank" rel="noopener" style="color:var(--accent2);font-weight:700">github.com/iran-px-panel/pxpanel</a>');
+}
+async function saveTelegram(){
+  const token=document.getElementById('tgToken').value.trim();
+  const admin=document.getElementById('tgAdmin').value.trim();
+  const webhook=document.getElementById('tgWebhook').checked;
+  if(!token||!admin){toast(lang==='fa'?'توکن و آیدی لازم است':'Token and admin ID required');return}
+  toast(lang==='fa'?'در حال فعال‌سازی...':'Activating...');
+  const r=await api('/api/telegram/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,admin_ids:admin,webhook})});
+  if(r){
+    document.getElementById('tgStatus').textContent=r.message||(lang==='fa'?'فعال شد':'Enabled');
+    toast(r.message||'OK');
+  }
+}
+async function loadTelegram(){
+  const r=await api('/api/telegram/settings');
+  if(!r)return;
+  if(r.admin_ids) document.getElementById('tgAdmin').value=r.admin_ids;
+  document.getElementById('tgWebhook').checked=r.webhook!==false;
+  document.getElementById('tgStatus').textContent=r.has_token?(lang==='fa'?'توکن ذخیره شده: ':'Token saved: ')+(r.token_masked||''):'';
+}
+const _goPage=goPage;
+goPage=function(name){
+  _goPage(name);
+  if(name==='telegram') loadTelegram();
+  if(name==='news') loadNews();
+  if(name==='admins') loadAdmins();
+  if(name==='groups') loadGroups();
+  if(name==='settings') loadSecurity();
+};
+
+const PERM_LABELS={
+  fa:{dash:'داشبورد',configs:'کانفیگ‌ها',create:'ساخت',stats:'آمار',logs:'لاگ',settings:'تنظیمات',support:'پشتیبانی',telegram:'ربات',news:'اخبار',admins:'ادمین‌ها'},
+  en:{dash:'Dashboard',configs:'Configs',create:'Create',stats:'Stats',logs:'Logs',settings:'Settings',support:'Support',telegram:'Bot',news:'News',admins:'Admins'}
+};
+let USER_PERMS=null;
+let USER_ROLE='owner';
+function buildPermChecks(containerId, selected){
+  const box=document.getElementById(containerId);
+  if(!box)return;
+  const labels=PERM_LABELS[lang]||PERM_LABELS.fa;
+  box.innerHTML=Object.keys(labels).map(k=>{
+    const on=selected?!!selected[k]:(['dash','configs','create','stats','news'].includes(k));
+    return `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:12px;background:var(--bg3);border:1px solid var(--card-b)">
+      <span style="font-size:12px;font-weight:600">${labels[k]}</span>
+      <label class="switch"><input type="checkbox" data-perm="${k}" ${on?'checked':''}><span class="slider"></span></label>
+    </div>`;
+  }).join('');
+}
+function readPermChecks(containerId){
+  const out={};
+  document.querySelectorAll('#'+containerId+' input[data-perm]').forEach(inp=>{out[inp.getAttribute('data-perm')]=inp.checked});
+  return out;
+}
+async function loadMe(){
+  const r=await api('/api/me');
+  if(!r)return;
+  USER_ROLE=r.role||'owner';
+  USER_PERMS=r.permissions||{};
+  document.querySelectorAll('.nav-item[data-perm]').forEach(el=>{
+    const p=el.getAttribute('data-perm');
+    if(USER_ROLE==='owner'){el.style.display='';return}
+    el.style.display=USER_PERMS[p]?'':'none';
+  });
+  // hide admins for non-owner always if no perm
+  document.querySelectorAll('.nav-item[data-page="admins"]').forEach(el=>{
+    if(USER_ROLE!=='owner') el.style.display='none';
+  });
+}
+async function loadNews(toastOk){
+  const r=await api('/api/news');
+  if(!r)return;
+  document.getElementById('newsTitle').textContent=r.title||(lang==='fa'?'بدون عنوان':'No title');
+  document.getElementById('newsBody').textContent=r.message||'';
+  document.getElementById('newsMeta').textContent=(lang==='fa'?'بروزرسانی: ':'Updated: ')+(r.updated_at||'—');
+  if(toastOk) toast(lang==='fa'?'اطلاعیه بروزرسانی شد':'News refreshed');
+}
+async function loadAdmins(){
+  buildPermChecks('adPerms');
+  const r=await api('/api/admins');
+  const box=document.getElementById('adminsList');
+  if(!r||!r.admins){box.innerHTML='<div style="color:var(--t3);text-align:center;padding:20px">—</div>';return}
+  if(!r.admins.length){box.innerHTML=`<div style="color:var(--t3);text-align:center;padding:20px">${lang==='fa'?'ادمینی نیست':'No admins'}</div>`;return}
+  const labels=PERM_LABELS[lang]||PERM_LABELS.fa;
+  box.innerHTML=r.admins.map(a=>{
+    const st=a.blocked?'🔴 مسدود':(a.valid?'🟢 فعال':'🟠 نامعتبر');
+    const perms=Object.entries(a.permissions||{}).filter(([,v])=>v).map(([k])=>labels[k]||k).join(' · ')||'—';
+    return `<div style="border:1px solid var(--card-b);border-radius:12px;padding:12px;margin-bottom:10px;background:var(--bg3)">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+        <div><b>${esc(a.username)}</b> <span style="font-size:11px;color:var(--t3)">${st}</span></div>
+        <div class="ops" style="align-items:center">
+          <label class="switch" title="مسدود">
+            <input type="checkbox" ${a.blocked?'checked':''} onchange="toggleBlockAdmin('${esc(a.id)}',this.checked)">
+            <span class="slider"></span>
+          </label>
+          <button class="btn btn-sm btn-d" onclick="deleteAdmin('${esc(a.id)}')">حذف</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--t3);margin-top:8px">حجم: ${fmtB(a.used_bytes)}${a.limit_bytes?(' / '+fmtB(a.limit_bytes)):' / ∞'} · انقضا: ${a.expires_at||'∞'}</div>
+      <div style="font-size:11px;color:var(--t2);margin-top:6px">${perms}</div>
+    </div>`;
+  }).join('');
+}
+async function createAdmin(){
+  const body={
+    username:document.getElementById('adUser').value.trim(),
+    password:document.getElementById('adPw').value,
+    repeat_password:document.getElementById('adPw2').value,
+    limit_value:Number(document.getElementById('adLimit').value)||0,
+    limit_unit:document.getElementById('adUnit').value,
+    expires_days:Number(document.getElementById('adDays').value)||0,
+    permissions:readPermChecks('adPerms')
+  };
+  const r=await api('/api/admins',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r){toast(lang==='fa'?'اکانت ساخته شد':'Created');document.getElementById('adUser').value='';document.getElementById('adPw').value='';document.getElementById('adPw2').value='';loadAdmins()}
+}
+async function toggleBlockAdmin(id,blocked){
+  const r=await api('/api/admins/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({blocked})});
+  if(r){toast(blocked?'مسدود شد':'رفع شد');loadAdmins()}
+}
+async function deleteAdmin(id){
+  if(!confirm(lang==='fa'?'حذف اکانت؟':'Delete?'))return;
+  const r=await api('/api/admins/'+id,{method:'DELETE'});
+  if(r){toast('OK');loadAdmins()}
+}
+
+
+async function loadProtocols(){
+  const r=await api('/api/protocols');
+  const list=(r&&r.protocols)||[];
+  const def=(r&&r.default)||'vless-ws';
+  ['cProto','aProto'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el)return;
+    el.innerHTML=list.map(p=>`<option value="${esc(p.id)}" ${p.id===def?'selected':''}>${esc(p.label||p.id)}</option>`).join('')
+      ||'<option value="vless-ws">VLESS WebSocket</option>';
+  });
+}
+let __allLinks=[];
+function filterConfigs(){
+  const q=(document.getElementById('cfgSearch')?.value||'').trim().toLowerCase();
+  if(!q){renderLinks(__allLinks);return}
+  renderLinks(__allLinks.filter(l=>{
+    const name=(l.label||l.name||'').toLowerCase();
+    const proto=(l.protocol||'').toLowerCase();
+    const uid=String(l.uuid||l.id||'').toLowerCase();
+    return name.includes(q)||proto.includes(q)||uid.includes(q);
+  }));
+}
+async function resetUsage(uid){
+  if(!confirm(lang==='fa'?'مصرف ریست شود؟':'Reset usage?'))return;
+  const r=await api('/api/links/'+uid+'/reset-usage',{method:'POST'});
+  if(r!==null){toast(lang==='fa'?'مصرف ریست شد':'Usage reset');refreshAll()}
+}
+
+
+let __dragUid=null;
+function cfgDragStart(e){__dragUid=e.currentTarget.getAttribute('data-uid');e.currentTarget.style.opacity='.5';e.dataTransfer.effectAllowed='move';}
+function cfgDragOver(e){e.preventDefault();e.dataTransfer.dropEffect='move';const tr=e.currentTarget;if(tr&&tr.tagName==='TR')tr.style.background='var(--hover)';}
+function cfgDragEnd(e){e.currentTarget.style.opacity='1';document.querySelectorAll('#linksTable tr').forEach(tr=>tr.style.background='');}
+async function cfgDrop(e){
+  e.preventDefault();
+  const target=e.currentTarget.getAttribute('data-uid');
+  document.querySelectorAll('#linksTable tr').forEach(tr=>tr.style.background='');
+  if(!__dragUid||!target||__dragUid===target)return;
+  const rows=[...document.querySelectorAll('#linksTable tr[data-uid]')];
+  const ids=rows.map(r=>r.getAttribute('data-uid'));
+  const from=ids.indexOf(__dragUid), to=ids.indexOf(target);
+  if(from<0||to<0)return;
+  ids.splice(from,1);ids.splice(to,0,__dragUid);
+  // reorder DOM optimistically
+  const tb=document.getElementById('linksTable');
+  ids.forEach(id=>{const el=tb.querySelector(`tr[data-uid="${id}"]`);if(el)tb.appendChild(el);});
+  await api('/api/links/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:ids})});
+  toast(lang==='fa'?'ترتیب ذخیره شد':'Order saved');
+}
+
+function updateBulkBar(){
+  const n=document.querySelectorAll('.cfg-chk:checked').length;
+  const bar=document.getElementById('bottomBulkBar');
+  const cnt=document.getElementById('bulkCount');
+  if(cnt) cnt.textContent = n + (lang==='fa'?' انتخاب‌شده':' selected');
+  if(bar) bar.classList.toggle('show', n>0);
+  const all=document.getElementById('chkAll');
+  if(all && n===0) all.checked=false;
+}
+function clearSelection(){
+  document.querySelectorAll('.cfg-chk').forEach(c=>c.checked=false);
+  const all=document.getElementById('chkAll');
+  if(all) all.checked=false;
+  updateBulkBar();
+}
+function toggleSelectAll(on){
+  document.querySelectorAll('.cfg-chk').forEach(c=>c.checked=!!on);
+  updateBulkBar();
+}
+
+function selectedCfgIds(){return [...document.querySelectorAll('.cfg-chk:checked')].map(c=>c.value)}
+async function bulkDelete(){
+  const ids=selectedCfgIds();
+  if(!ids.length){toast(lang==='fa'?'چیزی انتخاب نشده':'Nothing selected');return}
+  if(!confirm(lang==='fa'?`حذف ${ids.length} کانفیگ؟`:`Delete ${ids.length}?`))return;
+  const r=await api('/api/links/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+  if(r){toast(lang==='fa'?`حذف شد: ${r.deleted}`:`Deleted: ${r.deleted}`);refreshAll()}
+}
+async function bulkMoveGroup(){
+  const ids=selectedCfgIds();
+  const cid=document.getElementById('bulkGroup')?.value||'0';
+  if(!ids.length){toast(lang==='fa'?'چیزی انتخاب نشده':'Nothing selected');return}
+  const r=await api('/api/links/bulk-category',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,category_id:cid})});
+  if(r){toast(lang==='fa'?'به گروه منتقل شد':'Moved');refreshAll()}
+}
+async function loadGroups(){
+  const r=await api('/api/categories');
+  const list=(r&&r.categories)||[];
+  window.__catMap={};
+  list.forEach(g=>{window.__catMap[String(g.id)]=g.name||g.id});
+  const bulk=document.getElementById('bulkGroup');
+  const cGroup=document.getElementById('cGroup');
+  const opts=list.map(g=>`<option value="${esc(g.id)}">${esc(g.name||g.id)}</option>`).join('');
+  if(bulk) bulk.innerHTML=opts||'<option value="0">عمومی</option>';
+  if(cGroup) cGroup.innerHTML=opts||'<option value="0">عمومی</option>';
+  const box=document.getElementById('groupsList');
+  if(box){
+    if(!list.length){box.innerHTML='<div style="color:var(--t3);text-align:center;padding:16px">—</div>';}
+    else{
+      box.innerHTML=list.map(g=>{
+        const cnt=(__allLinks||[]).filter(l=>String(l.category_id||'0')===String(g.id)).length;
+        return `<div style="border:1px solid var(--card-b);border-radius:12px;padding:12px;margin-bottom:8px;background:var(--bg3);display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+          <div><b>${esc(g.name)}</b> <span style="font-size:11px;color:var(--t3)">${cnt} کانفیگ</span></div>
+          <button class="btn btn-sm btn-d" onclick="deleteGroup('${esc(g.id)}')">حذف</button>
+        </div>`;
+      }).join('');
+    }
+  }
+}
+async function createGroup(){
+  const name=document.getElementById('grpName').value.trim();
+  if(!name){toast('نام لازم است');return}
+  const r=await api('/api/categories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  if(r){toast('گروه ساخته شد');document.getElementById('grpName').value='';loadGroups()}
+}
+async function deleteGroup(id){
+  if(!confirm('حذف گروه؟'))return;
+  const r=await api('/api/categories/'+id,{method:'DELETE'});
+  if(r){toast('حذف شد');loadGroups();refreshAll()}
+}
+
+
+async function loadSecurity(){
+  const r=await api('/api/security/status');
+  const el=document.getElementById('secStatus');
+  if(!r||!el)return;
+  const locked=(r.locked_ips||[]).map(x=>`${x.ip} (${Math.ceil(x.remaining_sec/60)}د)`).join(' · ')||'—';
+  el.innerHTML=`حداکثر تلاش: <b>${r.max_attempts}</b> · قفل: <b>${Math.round(r.lockout_seconds/60)} دقیقه</b><br>IPهای مسدود: ${locked}`;
+}
+async function unlockAllIps(){
+  if(!confirm('رفع مسدودی همه؟'))return;
+  const r=await api('/api/security/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  if(r){toast('انجام شد');loadSecurity()}
+}
+
+
+async function downloadBackup(kind){
+  try{
+    const url = kind==='bot' ? '/api/backup/bot' : '/api/backup/users';
+    const r = await fetch(url, {credentials:'same-origin', cache:'no-store'});
+    if(r.status===401){ location.href='/login'; return; }
+    if(!r.ok){
+      let msg='خطا';
+      try{ const j=await r.json(); msg=j.detail||msg; }catch(e){}
+      toast(String(msg)); return;
+    }
+    const text = await r.text();
+    // validate json
+    try{ JSON.parse(text); }catch(e){ toast('پاسخ نامعتبر'); return; }
+    const blob = new Blob([text], {type:'application/json;charset=utf-8'});
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    a.href = URL.createObjectURL(blob);
+    a.download = kind==='bot' ? ('pxpanel-bot-'+stamp+'.json') : ('pxpanel-users-'+stamp+'.json');
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    toast(lang==='fa'?'دانلود شد':'Downloaded');
+  }catch(e){ toast(String(e.message||e)); }
+}
+function readJsonFile(inputId){
+  return new Promise((resolve,reject)=>{
+    const inp=document.getElementById(inputId);
+    if(!inp||!inp.files||!inp.files[0]){ reject(new Error(lang==='fa'?'فایل انتخاب نشده':'No file')); return; }
+    const fr=new FileReader();
+    fr.onload=()=>{ try{ resolve(JSON.parse(fr.result)); }catch(e){ reject(new Error('JSON نامعتبر')); } };
+    fr.onerror=()=>reject(new Error('خواندن فایل ناموفق'));
+    fr.readAsText(inp.files[0],'utf-8');
+  });
+}
+async function restoreUsers(mode){
+  try{
+    const data = await readJsonFile('restoreUsersFile');
+    data.mode = mode||'merge';
+    if(mode==='replace' && !confirm(lang==='fa'?'همه داده‌های فعلی پاک و جایگزین می‌شود. مطمئنی؟':'Replace all current data?')) return;
+    const r = await api('/api/restore/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    if(r){ toast(lang==='fa'?('بازیابی شد: '+r.links+' کانفیگ'):('Restored: '+r.links)); refreshAll(); }
+  }catch(e){ toast(e.message||String(e)); }
+}
+async function restoreBot(){
+  try{
+    const data = await readJsonFile('restoreBotFile');
+    const r = await api('/api/restore/bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    if(r) toast(r.message||(lang==='fa'?'ربات بازیابی شد':'Bot restored'));
+  }catch(e){ toast(e.message||String(e)); }
+}
+
+applyLang();loadMe();loadProtocols();loadGroups();refreshAll();setInterval(refreshAll,1000);
+
+
+</script>
 </body>
 </html>
 """
+
+
 
 
 @app.get(

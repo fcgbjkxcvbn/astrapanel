@@ -1,10 +1,4 @@
 # xhttp_siz10.py
-# ══════════════════════════════════════════════════════════════════════════════
-# Siz10a · XHTTP Ultra Transport — دو مد: packet-up / stream-up
-#  (stream-one حذف شد. منطق relay_vless دست‌نخورده.
-#   stream-up بازنویسی شده با موتور تطبیقی: _AdaptiveFlow (AIMD روی high-water)
-#   + _QuotaGate تطبیقی (batch بر اساس نرخ واقعی هر سشن) + سوکت تیون‌شده)
-# ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
 import secrets
@@ -37,24 +31,18 @@ DOWNLINK_QUEUE_MAX = 512
 SESSION_IDLE_TIMEOUT = 30
 REAPER_INTERVAL = 10
 TCP_CONNECT_TIMEOUT = 10.0
-
-# ── تنظیمات موتور تطبیقی ──────────────────────────────────────────────────────
-SOCK_BUF_SIZE = 2 * 1024 * 1024     # SO_SNDBUF / SO_RCVBUF
-
-# _AdaptiveFlow: بازه‌ی مجاز برای high-water تطبیقی (AIMD)
+SOCK_BUF_SIZE = 2 * 1024 * 1024
 FLOW_MIN_HW = 256 * 1024
 FLOW_MAX_HW = 16 * 1024 * 1024
 FLOW_START_HW = 2 * 1024 * 1024
-FLOW_FAST_DRAIN_MS = 2.0    # زیر این یعنی downstream خیلی سریعه → بافر مجاز رو زیاد کن
-FLOW_SLOW_DRAIN_MS = 25.0   # بالای این یعنی backpressure واقعی → فوری نصفش کن
-
-# _QuotaGate: بازه‌ی مجاز برای batch تطبیقی چک کوتا
+FLOW_FAST_DRAIN_MS = 2.0  
+FLOW_SLOW_DRAIN_MS = 25.0  
 QUOTA_MIN_BATCH = 32 * 1024
 QUOTA_MAX_BATCH = 1 * 1024 * 1024
 QUOTA_START_BATCH = 64 * 1024
-QUOTA_CHECK_INTERVAL = 0.2  # سقف زمانی؛ حتی اگر batch پر نشده، بعد این مدت چک کن
+QUOTA_CHECK_INTERVAL = 0.2 
 
-PACKET_UP_HIGH_WATER = 2 * 1024 * 1024  # packet-up همون منطق ساده‌ی قبلی رو داره (تمرکز این راند فقط stream-up بود)
+PACKET_UP_HIGH_WATER = 2 * 1024 * 1024  
 
 xhttp_sessions: dict = {}
 XHTTP_LOCK = asyncio.Lock()
@@ -80,7 +68,6 @@ def _resp_headers(fp: str) -> dict:
 
 
 def _tune_socket(writer: asyncio.StreamWriter):
-    """TCP_NODELAY + بافرهای بزرگ‌تر سوکت برای کاهش سربار سیستم‌عامل روی ترافیک بالا."""
     sock = writer.transport.get_extra_info("socket")
     if not sock:
         return
@@ -93,15 +80,6 @@ def _tune_socket(writer: asyncio.StreamWriter):
 
 
 class _QuotaGate:
-    """
-    نسخه‌ی تطبیقی: به‌جای await check_and_use() به‌ازای هر چانک، و به‌جای یک آستانه‌ی
-    ثابت، نرخ واقعی ترافیک هر سشن رو با EWMA اندازه می‌گیره و اندازه‌ی batch رو زنده
-    عوض می‌کنه:
-      - سشن پرسرعت (دانلود حجیم) → batch بزرگ می‌شه → await های سنگین کمتر.
-      - سشن کم‌ترافیک/تعاملی → batch کوچیک می‌مونه → کوتا دقیق‌تر و قطع سریع‌تر
-        اگه کاربر تموم کرده باشه.
-    داده هیچ‌وقت نگه داشته نمی‌شه، فقط لحظه‌ی چک‌کردنِ کوتا adaptive هست.
-    """
     __slots__ = ("uuid", "pending", "last_check", "ok", "batch_bytes", "rate_ewma")
 
     def __init__(self, uuid: str):
@@ -138,16 +116,6 @@ class _QuotaGate:
 
 
 class _AdaptiveFlow:
-    """
-    high-water تطبیقی برای drain(), رفتار شبیه AIMD در TCP congestion control:
-      - هر بار drain() صدا زده می‌شه، مدت زمانش اندازه‌گیری می‌شه.
-      - اگه سریع تموم بشه (لینک پایین‌دستی داره جواب می‌ده) → سقف بافر مجاز رو
-        additive increase می‌کنیم؛ یعنی دفعه‌ی بعد دیرتر drain صدا زده می‌شه،
-        پس syscall/context-switch کمتر می‌شه و throughput واقعی بالا می‌ره.
-      - اگه drain کند بشه (backpressure واقعیه، صف داره جمع می‌شه) → سقف رو فوری
-        نصف می‌کنیم (multiplicative decrease) تا بافربلوت/لتنسی رشد نکنه.
-    هر سشن یک نمونه‌ی جدا از این داره، پس مسیرهای کند و سریع تداخلی با هم ندارن.
-    """
     __slots__ = ("high_water", "last_drain_ms")
 
     def __init__(self):
@@ -198,7 +166,6 @@ async def _check_link(uuid: str):
 
 
 async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
-    """Session بر اساس session_id که خودِ کلاینت در URL فرستاده، lazily ساخته می‌شه."""
     async with XHTTP_LOCK:
         sess = xhttp_sessions.get(session_id)
         if sess is not None:
@@ -288,7 +255,7 @@ def ensure_reaper():
 
 async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamReader, down_q: asyncio.Queue):
     first = True
-    gate = _QuotaGate(uuid)  # دانلینک هم از همون گیت batched استفاده می‌کنه
+    gate = _QuotaGate(uuid) 
     try:
         while True:
             data = await reader.read(XHTTP_BUF)
@@ -314,7 +281,6 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 
 
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
-    """تونل TCP رو از روی هدر VLESS باز می‌کنه و پمپ دانلینک رو راه می‌اندازه."""
     reader, writer, address, port = await _open_tcp_from_header(first_chunk)
     logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
     sess["writer"] = writer
@@ -339,7 +305,6 @@ def _downstream_gen(sess: dict):
     return gen()
 
 
-# ══════════════════════════════ GET دانلینک (مشترک بین سه مد) ══════════════════════════════
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
 async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
     ensure_reaper()
@@ -355,7 +320,6 @@ async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request
     return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers["content-type"])
 
 
-# ══════════════════════════════ PACKET-UP (آپلینک با seq) ══════════════════════════════
 @router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
 async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
     ensure_reaper()
@@ -378,8 +342,6 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
 
     try:
         if sess["writer"] is None:
-            # اولین پکتی که حاوی هدر VLESS است، می‌تونه seq=0 نباشه اگر پکت‌ها
-            # خارج از ترتیب برسن؛ بافر کوچیک برای سورت کردن seqهای زودرس.
             if seq != 0:
                 sess["seq_buf"][seq] = body
                 return {"ok": True, "buffered": True}
